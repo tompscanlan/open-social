@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenSocial API
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=azureuser
+WorkingDirectory=/home/azureuser/open-social
+Environment=NODE_ENV=production
+EnvironmentFile=/home/azureuser/open-social/.env
+ExecStart=/usr/bin/node /home/azureuser/open-social/dist/index.js
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/open-social/output.log
+StandardError=append:/var/log/open-social/error.log
+
+[Install]
+WantedBy=multi-user.target
