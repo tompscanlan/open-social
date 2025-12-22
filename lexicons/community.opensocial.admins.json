@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "record",
-      "description": "List of community administrators with permissions",
+      "description": "List of community administrators",
       "key": "literal:self",
       "record": {
         "type": "object",
@@ -14,18 +14,11 @@
             "type": "array",
             "items": {
               "type": "object",
-              "required": ["did", "permissions"],
+              "required": ["did"],
               "properties": {
                 "did": {
                   "type": "string",
                   "format": "did"
-                },
-                "permissions": {
-                  "type": "array",
-                  "items": {
-                    "type": "string",
-                    "enum": ["edit_profile", "manage_admins", "moderate", "post"]
-                  }
                 },
                 "addedAt": {
                   "type": "string",

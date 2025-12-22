@@ -38,6 +38,14 @@
             "type": "string",
             "maxLength": 3000,
             "description": "Community guidelines and rules"
+          },
+          "labelers": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "did"
+            },
+            "description": "List of labeler DIDs for community moderation"
           }
         }
       }
