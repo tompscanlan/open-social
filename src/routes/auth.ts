@@ -1,9 +1,10 @@
-import { Agent } from '@atproto/api';
+import { Agent, BskyAgent } from '@atproto/api';
 import { OAuthResolverError } from '@atproto/oauth-client-node';
 import express, { Request, Response } from 'express';
 import { getIronSession } from 'iron-session';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { NodeOAuthClient } from '@atproto/oauth-client-node';
+import crypto from 'crypto';
 import { config } from '../config';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
@@ -278,6 +279,201 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
     } catch (err) {
       console.error('Failed to get memberships:', err);
       return res.status(500).json({ error: 'Failed to get memberships' });
+    }
+  });
+
+  // Create a new community
+  router.post('/users/me/communities', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const { type, name, displayName, description, did: existingDid, appPassword } = req.body;
+
+      if (!displayName) {
+        return res.status(400).json({ error: 'displayName is required' });
+      }
+
+      let communityDid: string;
+      let communityHandle: string;
+      let communityAgent: Agent;
+
+      if (type === 'new') {
+        // Create new community on opensocial.community PDS
+        if (!name) {
+          return res.status(400).json({ error: 'name is required for new communities' });
+        }
+
+        const handle = `${name}.opensocial.community`;
+        const pdsHost = config.pdsUrl || 'https://opensocial.community';
+        const accountPassword = crypto.randomBytes(32).toString('hex');
+
+        console.log(`Creating PDS account for ${handle}...`);
+
+        // Create account on PDS
+        const createResponse = await fetch(`${pdsHost}/xrpc/com.atproto.server.createAccount`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: `${name}@opensocial.community`,
+            handle: handle,
+            password: accountPassword,
+          }),
+        });
+
+        if (!createResponse.ok) {
+          const error = await createResponse.json() as { message?: string };
+          console.error('PDS account creation failed:', error);
+          return res.status(500).json({ 
+            error: 'Failed to create PDS account',
+            details: error.message || 'Unknown error'
+          });
+        }
+
+        const accountData = await createResponse.json() as { did: string; handle: string };
+        communityDid = accountData.did;
+        communityHandle = handle;
+
+        console.log(`Created community account with DID: ${communityDid}`);
+
+        // Wait for account to be ready
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        // Login as the community
+        const bskyAgent = new BskyAgent({ service: pdsHost });
+        await bskyAgent.login({
+          identifier: handle,
+          password: accountPassword,
+        });
+        communityAgent = bskyAgent;
+
+        // Store password in database (encrypted in production!)
+        await db
+          .insertInto('communities')
+          .values({
+            did: communityDid,
+            handle: communityHandle,
+            pds_host: pdsHost,
+            app_password: accountPassword,
+            created_at: new Date(),
+          })
+          .execute();
+
+      } else if (type === 'existing') {
+        // Use existing DID with app password
+        if (!existingDid || !appPassword) {
+          return res.status(400).json({ error: 'did and appPassword are required for existing communities' });
+        }
+
+        communityDid = existingDid;
+
+        // Resolve DID to get handle and PDS
+        const didDoc = await agent.api.com.atproto.identity.resolveHandle({
+          handle: existingDid,
+        }).catch(() => null);
+        
+        communityHandle = didDoc?.data.did || existingDid;
+        
+        // Try to get profile to find PDS
+        let pdsHost = 'https://bsky.social'; // Default to Bluesky PDS
+        try {
+          const profile = await agent.getProfile({ actor: existingDid });
+          // Extract PDS from profile if available
+          pdsHost = profile.data.did ? 'https://bsky.social' : 'https://bsky.social';
+        } catch (e) {
+          console.warn('Could not resolve PDS, using default');
+        }
+
+        // Login with app password
+        const bskyAgent = new BskyAgent({ service: pdsHost });
+        await bskyAgent.login({
+          identifier: existingDid,
+          password: appPassword,
+        });
+        communityAgent = bskyAgent;
+
+        // Store in database
+        await db
+          .insertInto('communities')
+          .values({
+            did: communityDid,
+            handle: communityHandle,
+            pds_host: pdsHost,
+            app_password: appPassword,
+            created_at: new Date(),
+          })
+          .execute();
+
+      } else {
+        return res.status(400).json({ error: 'Invalid type. Must be "new" or "existing"' });
+      }
+
+      // Create community profile
+      await communityAgent.api.com.atproto.repo.putRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.profile',
+        rkey: 'self',
+        record: {
+          $type: 'community.opensocial.profile',
+          displayName,
+          description: description || '',
+          createdAt: new Date().toISOString(),
+        },
+      });
+
+      // Create admin list with creator as first admin
+      await communityAgent.api.com.atproto.repo.putRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.admins',
+        rkey: 'self',
+        record: {
+          $type: 'community.opensocial.admins',
+          admins: [agent.assertDid],
+          createdAt: new Date().toISOString(),
+        },
+      });
+
+      // Create membership record in user's repo
+      const membershipRecord = await agent.api.com.atproto.repo.createRecord({
+        repo: agent.assertDid,
+        collection: 'community.opensocial.membership',
+        record: {
+          $type: 'community.opensocial.membership',
+          community: communityDid,
+          joinedAt: new Date().toISOString(),
+        },
+      });
+
+      // Create member confirmation in community's repo
+      await communityAgent.api.com.atproto.repo.createRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.member',
+        record: {
+          $type: 'community.opensocial.member',
+          userDid: agent.assertDid,
+          membershipRef: membershipRecord.data.uri,
+          confirmedAt: new Date().toISOString(),
+        },
+      });
+
+      return res.json({
+        success: true,
+        community: {
+          did: communityDid,
+          handle: communityHandle,
+          displayName,
+          description,
+        },
+      });
+    } catch (err) {
+      console.error('Failed to create community:', err);
+      return res.status(500).json({ 
+        error: 'Failed to create community',
+        details: err instanceof Error ? err.message : 'Unknown error'
+      });
     }
   });
 

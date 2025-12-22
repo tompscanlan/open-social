@@ -2,9 +2,18 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import { Pool } from 'pg';
 import type { AuthState, AuthSession } from './models/auth';
 
+export interface Community {
+  did: string;
+  handle: string;
+  pds_host: string;
+  app_password: string;
+  created_at: Date;
+}
+
 export interface Database {
   auth_state: AuthState;
   auth_session: AuthSession;
+  communities: Community;
 }
 
 export function createDb(connectionString: string): Kysely<Database> {

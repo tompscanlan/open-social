@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import { sql } from 'kysely';
 import { config } from './config';
 import { createDb } from './db';
 import { createOAuthClient } from './auth/client';
@@ -50,6 +51,17 @@ async function start() {
       .ifNotExists()
       .addColumn('key', 'varchar(255)', (col) => col.primaryKey())
       .addColumn('session', 'text', (col) => col.notNull())
+      .execute();
+
+    // Create communities table if it doesn't exist
+    await db.schema
+      .createTable('communities')
+      .ifNotExists()
+      .addColumn('did', 'varchar(255)', (col) => col.primaryKey())
+      .addColumn('handle', 'varchar(255)', (col) => col.notNull().unique())
+      .addColumn('pds_host', 'varchar(255)', (col) => col.notNull())
+      .addColumn('app_password', 'text', (col) => col.notNull())
+      .addColumn('created_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
       .execute();
 
     console.log('✅ Auth tables ready');
