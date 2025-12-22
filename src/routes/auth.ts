@@ -717,5 +717,83 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
     }
   });
 
+  // Update community profile (name and description)
+  router.put('/communities/:did/profile', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const communityDid = decodeURIComponent(req.params.did);
+      const { displayName, description } = req.body;
+
+      // Validate input
+      if (!displayName || typeof displayName !== 'string' || !displayName.trim()) {
+        return res.status(400).json({ error: 'displayName is required' });
+      }
+
+      // Get community from database
+      const community = await db
+        .selectFrom('communities')
+        .selectAll()
+        .where('did', '=', communityDid)
+        .executeTakeFirst();
+
+      if (!community) {
+        return res.status(404).json({ error: 'Community not found' });
+      }
+
+      // Create community agent
+      const communityAgent = new BskyAgent({ service: community.pds_host });
+      await communityAgent.login({
+        identifier: community.handle,
+        password: community.app_password,
+      });
+
+      // Check if user is admin
+      const adminsResponse = await communityAgent.api.com.atproto.repo.getRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.admins',
+        rkey: 'self',
+      });
+
+      const adminsValue = adminsResponse.data.value as { admins: string[] };
+      if (!adminsValue.admins.includes(agent.assertDid)) {
+        return res.status(403).json({ error: 'Not authorized. Must be an admin.' });
+      }
+
+      // Get current profile
+      const profileResponse = await communityAgent.api.com.atproto.repo.getRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.profile',
+        rkey: 'self',
+      });
+
+      const currentProfile = profileResponse.data.value as CommunityProfile;
+
+      // Update profile with new values
+      await communityAgent.api.com.atproto.repo.putRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.profile',
+        rkey: 'self',
+        record: {
+          ...currentProfile,
+          $type: 'community.opensocial.profile',
+          displayName: displayName.trim(),
+          description: description ? description.trim() : '',
+        },
+      });
+
+      return res.json({ success: true });
+    } catch (err) {
+      console.error('Failed to update community profile:', err);
+      return res.status(500).json({ 
+        error: 'Failed to update community profile',
+        details: err instanceof Error ? err.message : 'Unknown error'
+      });
+    }
+  });
+
   return router;
 }
