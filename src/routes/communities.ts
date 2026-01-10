@@ -66,17 +66,49 @@ router.post('/', verifyApiKey, async (req: AuthenticatedRequest, res) => {
       password: accountPassword,
     });
 
+    // Fetch creator's Bluesky profile to get avatar
+    let avatarBlob = undefined;
+    try {
+      const publicAgent = new BskyAgent({ service: 'https://public.api.bsky.app' });
+      const creatorProfile = await publicAgent.getProfile({ actor: creator_did });
+      
+      if (creatorProfile.data.avatar) {
+        // Download the avatar image
+        const avatarResponse = await fetch(creatorProfile.data.avatar);
+        if (avatarResponse.ok) {
+          const avatarBuffer = await avatarResponse.arrayBuffer();
+          const avatarUint8 = new Uint8Array(avatarBuffer);
+          
+          // Upload the avatar to the community's repo
+          const uploadResponse = await agent.uploadBlob(avatarUint8, {
+            encoding: avatarResponse.headers.get('content-type') || 'image/jpeg',
+          });
+          avatarBlob = uploadResponse.data.blob;
+          console.log('Avatar uploaded successfully');
+        }
+      }
+    } catch (error) {
+      console.warn('Could not fetch/upload avatar from creator profile:', error);
+      // Continue without avatar
+    }
+
     // Create profile record
+    const profileRecord: any = {
+      $type: 'community.opensocial.profile',
+      displayName: display_name,
+      description: description || '',
+      createdAt: new Date().toISOString(),
+    };
+
+    if (avatarBlob) {
+      profileRecord.avatar = avatarBlob;
+    }
+
     await agent.com.atproto.repo.putRecord({
       repo: did,
       collection: 'community.opensocial.profile',
       rkey: 'self',
-      record: {
-        $type: 'community.opensocial.profile',
-        displayName: display_name,
-        description: description || '',
-        createdAt: new Date().toISOString(),
-      },
+      record: profileRecord,
     });
 
     // Create admins record
@@ -221,6 +253,71 @@ router.get('/:id', verifyApiKey, async (req: AuthenticatedRequest, res) => {
   } catch (error) {
     console.error('Error fetching community:', error);
     res.status(500).json({ error: 'Failed to fetch community' });
+  }
+});
+
+// Delete a community
+router.delete('/:id', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+  const { id } = req.params;
+  const { user_did } = req.body;
+
+  if (!user_did) {
+    return res.status(400).json({
+      error: 'Missing required field: user_did',
+    });
+  }
+
+  try {
+    // Fetch community from database
+    const result = await pool.query(
+      'SELECT * FROM communities WHERE community_id = $1 AND app_id = $2',
+      [id, req.app_data!.app_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Community not found' });
+    }
+
+    const community = result.rows[0];
+    const agent = await getPublicAgent(community.pds_host);
+
+    // Fetch admins to verify permissions
+    const adminRecord = await agent.com.atproto.repo.getRecord({
+      repo: community.did,
+      collection: 'community.opensocial.admins',
+      rkey: 'self',
+    });
+
+    const admins = (adminRecord.data.value as any).admins || [];
+
+    // Check if user is an admin
+    const isAdmin = admins.some((admin: any) => admin.did === user_did);
+    if (!isAdmin) {
+      return res.status(403).json({
+        error: 'Only admins can delete a community',
+      });
+    }
+
+    // Check if there's only one admin
+    if (admins.length > 1) {
+      return res.status(403).json({
+        error: 'Community can only be deleted when there is a single admin',
+      });
+    }
+
+    // Delete from database
+    await pool.query(
+      'DELETE FROM communities WHERE community_id = $1 AND app_id = $2',
+      [id, req.app_data!.app_id]
+    );
+
+    res.json({
+      success: true,
+      message: 'Community deleted successfully',
+    });
+  } catch (error) {
+    console.error('Error deleting community:', error);
+    res.status(500).json({ error: 'Failed to delete community' });
   }
 });
 

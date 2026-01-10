@@ -804,5 +804,78 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
     }
   });
 
+  // Delete a community
+  router.delete('/communities/:did', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const { did } = req.params;
+      const userDid = agent.assertDid;
+
+      // Get community credentials from database
+      const community = await db
+        .selectFrom('communities')
+        .selectAll()
+        .where('did', '=', did)
+        .executeTakeFirst();
+
+      if (!community) {
+        return res.status(404).json({ error: 'Community not found' });
+      }
+
+      // Create agent for the community
+      const communityAgent = new BskyAgent({ service: community.pds_host });
+      await communityAgent.login({
+        identifier: community.handle,
+        password: community.app_password,
+      });
+
+      // Fetch admins to verify permissions
+      const adminRecord = await communityAgent.api.com.atproto.repo.getRecord({
+        repo: did,
+        collection: 'community.opensocial.admins',
+        rkey: 'self',
+      });
+
+      const admins = (adminRecord.data.value as any).admins || [];
+
+      // Check if user is an admin
+      const isAdmin = admins.some((admin: any) => admin.did === userDid);
+      if (!isAdmin) {
+        return res.status(403).json({
+          error: 'Only admins can delete a community',
+        });
+      }
+
+      // Check if there's only one admin
+      if (admins.length > 1) {
+        return res.status(403).json({
+          error: 'Community can only be deleted when there is a single admin',
+        });
+      }
+
+      // Delete from database
+      await db
+        .deleteFrom('communities')
+        .where('did', '=', did)
+        .execute();
+
+      return res.json({
+        success: true,
+        message: 'Community deleted successfully',
+      });
+    } catch (err) {
+      console.error('Failed to delete community:', err);
+      return res.status(500).json({ 
+        error: 'Failed to delete community',
+        details: err instanceof Error ? err.message : 'Unknown error'
+      });
+    }
+  });
+
   return router;
 }
