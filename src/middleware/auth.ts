@@ -1,35 +1,49 @@
 import { Request, Response, NextFunction } from 'express';
-import pool from '../services/database';
+import type { Kysely } from 'kysely';
+import type { Database } from '../db';
 
 export interface AuthenticatedRequest extends Request {
-  app_data?: any;
+  app_data?: {
+    app_id: string;
+    name: string;
+    domain: string;
+    creator_did: string;
+    api_key: string;
+    status: string;
+    created_at: Date;
+    updated_at: Date;
+  };
 }
 
-export async function verifyApiKey(
-  req: AuthenticatedRequest,
-  res: Response,
-  next: NextFunction
-) {
-  const apiKey = req.headers['x-api-key'] as string;
+export function createVerifyApiKey(db: Kysely<Database>) {
+  return async function verifyApiKey(
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction
+  ) {
+    const apiKey = req.headers['x-api-key'] as string;
 
-  if (!apiKey) {
-    return res.status(401).json({ error: 'API key required' });
-  }
-
-  try {
-    const result = await pool.query(
-      'SELECT * FROM apps WHERE api_key = $1 AND status = $2',
-      [apiKey, 'active']
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid API key' });
+    if (!apiKey) {
+      return res.status(401).json({ error: 'API key required' });
     }
 
-    req.app_data = result.rows[0];
-    next();
-  } catch (error) {
-    console.error('Auth error:', error);
-    res.status(500).json({ error: 'Authentication failed' });
-  }
+    try {
+      const app = await db
+        .selectFrom('apps')
+        .selectAll()
+        .where('api_key', '=', apiKey)
+        .where('status', '=', 'active')
+        .executeTakeFirst();
+
+      if (!app) {
+        return res.status(401).json({ error: 'Invalid API key' });
+      }
+
+      req.app_data = app;
+      next();
+    } catch (error) {
+      console.error('Auth error:', error);
+      res.status(500).json({ error: 'Authentication failed' });
+    }
+  };
 }

@@ -6,9 +6,9 @@ import { config } from './config';
 import { createDb } from './db';
 import { createOAuthClient } from './auth/client';
 import { createAuthRouter } from './routes/auth';
-import appRoutes from './routes/apps';
-import communityRoutes from './routes/communities';
-import memberRoutes from './routes/members';
+import { createAppRouter } from './routes/apps';
+import { createCommunityRouter } from './routes/communities';
+import { createMemberRouter } from './routes/members';
 
 dotenv.config();
 
@@ -59,12 +59,38 @@ async function start() {
       .ifNotExists()
       .addColumn('did', 'varchar(255)', (col) => col.primaryKey())
       .addColumn('handle', 'varchar(255)', (col) => col.notNull().unique())
+      .addColumn('display_name', 'varchar(255)', (col) => col.notNull().defaultTo(''))
       .addColumn('pds_host', 'varchar(255)', (col) => col.notNull())
       .addColumn('app_password', 'text', (col) => col.notNull())
       .addColumn('created_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
       .execute();
 
-    console.log('✅ Auth tables ready');
+    // Migrate: add display_name column if it doesn't exist yet
+    try {
+      await sql`ALTER TABLE communities ADD COLUMN IF NOT EXISTS display_name varchar(255) NOT NULL DEFAULT ''`.execute(db);
+    } catch (e) { /* column already exists */ }
+
+    // Migrate: drop legacy api_secret_hash column if it still exists
+    try {
+      await sql`ALTER TABLE apps DROP COLUMN IF EXISTS api_secret_hash`.execute(db);
+    } catch (e) { /* column already gone */ }
+
+    // Create apps table if it doesn't exist
+    await db.schema
+      .createTable('apps')
+      .ifNotExists()
+      .addColumn('id', 'serial', (col) => col.primaryKey())
+      .addColumn('app_id', 'varchar(255)', (col) => col.notNull().unique())
+      .addColumn('name', 'varchar(255)', (col) => col.notNull())
+      .addColumn('domain', 'varchar(255)', (col) => col.notNull())
+      .addColumn('creator_did', 'varchar(255)', (col) => col.notNull())
+      .addColumn('api_key', 'varchar(255)', (col) => col.notNull().unique())
+      .addColumn('created_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .addColumn('updated_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .addColumn('status', 'varchar(50)', (col) => col.notNull().defaultTo('active'))
+      .execute();
+
+    console.log('✅ Database tables ready');
 
     // Initialize OAuth client
     const oauthClient = await createOAuthClient(db);
@@ -82,9 +108,9 @@ async function start() {
       });
     });
 
-    app.use('/api/v1/apps', appRoutes);
-    app.use('/api/v1/communities', communityRoutes);
-    app.use('/api/v1/communities', memberRoutes);
+    app.use('/api/v1/apps', createAppRouter(oauthClient, db));
+    app.use('/api/v1/communities', createCommunityRouter(db));
+    app.use('/api/v1/communities', createMemberRouter(db));
 
     // Error handling
     app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {

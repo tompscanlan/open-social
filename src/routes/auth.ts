@@ -1,5 +1,4 @@
 import { Agent, BskyAgent } from '@atproto/api';
-import { OAuthResolverError } from '@atproto/oauth-client-node';
 import express, { Request, Response } from 'express';
 import { getIronSession } from 'iron-session';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -410,6 +409,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
           .values({
             did: communityDid,
             handle: communityHandle,
+            display_name: displayName,
             pds_host: pdsHost,
             app_password: accountPassword,
             created_at: new Date(),
@@ -425,20 +425,13 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         communityDid = existingDid;
 
         // Resolve DID to get handle and PDS
-        const didDoc = await agent.api.com.atproto.identity.resolveHandle({
-          handle: existingDid,
-        }).catch(() => null);
-        
-        communityHandle = didDoc?.data.did || existingDid;
-        
-        // Try to get profile to find PDS
-        let pdsHost = 'https://bsky.social'; // Default to Bluesky PDS
+        let pdsHost = 'https://bsky.social';
         try {
           const profile = await agent.getProfile({ actor: existingDid });
-          // Extract PDS from profile if available
-          pdsHost = profile.data.did ? 'https://bsky.social' : 'https://bsky.social';
+          communityHandle = profile.data.handle || existingDid;
         } catch (e) {
-          console.warn('Could not resolve PDS, using default');
+          console.warn('Could not resolve handle, using DID as fallback');
+          communityHandle = existingDid;
         }
 
         // Login with app password
@@ -455,6 +448,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
           .values({
             did: communityDid,
             handle: communityHandle,
+            display_name: displayName,
             pds_host: pdsHost,
             app_password: appPassword,
             created_at: new Date(),

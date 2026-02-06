@@ -1,58 +1,312 @@
-import { Router } from 'express';
-import bcrypt from 'bcrypt';
+import { Agent } from '@atproto/api';
+import express, { Request, Response } from 'express';
+import { getIronSession } from 'iron-session';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { NodeOAuthClient } from '@atproto/oauth-client-node';
 import crypto from 'crypto';
-import pool from '../services/database';
-import { verifyApiKey } from '../middleware/auth';
+import { config } from '../config';
+import type { Kysely } from 'kysely';
+import type { Database } from '../db';
 
-const router = Router();
+type Session = { did?: string };
 
-// Register a new app
-router.post('/register', async (req, res) => {
-  const { name, domain, creator_did } = req.body;
+const MAX_AGE = config.nodeEnv === 'production' ? 60 : 300;
 
-  if (!name || !domain || !creator_did) {
-    return res.status(400).json({
-      error: 'Missing required fields: name, domain, creator_did',
-    });
-  }
+const sessionOptions = {
+  cookieName: 'sid',
+  password: config.cookieSecret,
+  cookieOptions: {
+    secure: config.nodeEnv === 'production',
+    sameSite: 'lax' as const,
+    httpOnly: true,
+    path: '/',
+  },
+};
 
+async function getSessionAgent(
+  req: IncomingMessage,
+  res: ServerResponse,
+  oauthClient: NodeOAuthClient
+) {
+  res.setHeader('Vary', 'Cookie');
+  const session = await getIronSession<Session>(req, res, sessionOptions);
+  if (!session.did) return null;
+  res.setHeader('cache-control', `max-age=${MAX_AGE}, private`);
   try {
-    const appId = `app_${crypto.randomBytes(8).toString('hex')}`;
-    const apiKey = `osc_${crypto.randomBytes(32).toString('hex')}`;
-    const apiSecret = crypto.randomBytes(32).toString('hex');
-    const apiSecretHash = await bcrypt.hash(apiSecret, 10);
-
-    const result = await pool.query(
-      `INSERT INTO apps (app_id, name, domain, creator_did, api_key, api_secret_hash)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING app_id, name, domain, api_key, created_at`,
-      [appId, name, domain, creator_did, apiKey, apiSecretHash]
-    );
-
-    res.json({
-      app: result.rows[0],
-      api_secret: apiSecret,
-      message: 'Store the api_secret securely - it will not be shown again',
-    });
-  } catch (error: any) {
-    console.error('Error registering app:', error);
-    
-    if (error.constraint) {
-      return res.status(409).json({ error: 'App with this domain already exists' });
-    }
-    
-    res.status(500).json({ error: 'Failed to register app' });
+    const oauthSession = await oauthClient.restore(session.did);
+    return oauthSession ? new Agent(oauthSession) : null;
+  } catch (err) {
+    console.warn('OAuth restore failed:', err);
+    await session.destroy();
+    return null;
   }
-});
+}
 
-// Get app details (authenticated)
-router.get('/me', verifyApiKey, async (req: any, res) => {
-  res.json({
-    app_id: req.app_data.app_id,
-    name: req.app_data.name,
-    domain: req.app_data.domain,
-    created_at: req.app_data.created_at,
+export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Database>) {
+  const router = express.Router();
+
+  // Register a new app (requires OAuth session — user must be logged in)
+  router.post('/register', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated. Log in to register an app.' });
+      }
+
+      const { name, domain } = req.body;
+      if (!name || !domain) {
+        return res.status(400).json({ error: 'Missing required fields: name, domain' });
+      }
+      if (typeof domain !== 'string' || !domain.includes('.')) {
+        return res.status(400).json({ error: 'Invalid domain format' });
+      }
+
+      // Check for duplicate domain
+      const existing = await db
+        .selectFrom('apps')
+        .selectAll()
+        .where('domain', '=', domain)
+        .where('status', '=', 'active')
+        .executeTakeFirst();
+      if (existing) {
+        return res.status(409).json({ error: 'An active app with this domain already exists' });
+      }
+
+      const creatorDid = agent.assertDid;
+      const appId = `app_${crypto.randomBytes(8).toString('hex')}`;
+      const apiKey = `osc_${crypto.randomBytes(32).toString('hex')}`;
+
+      await db
+        .insertInto('apps')
+        .values({
+          app_id: appId,
+          name,
+          domain,
+          creator_did: creatorDid,
+          api_key: apiKey,
+          created_at: new Date(),
+          updated_at: new Date(),
+          status: 'active',
+        })
+        .execute();
+
+      return res.json({
+        app: {
+          app_id: appId,
+          name,
+          domain,
+          api_key: apiKey,
+          created_at: new Date().toISOString(),
+        },
+        message: 'Store the api_key securely — treat it like a password.',
+      });
+    } catch (err) {
+      console.error('Error registering app:', err);
+      return res.status(500).json({ error: 'Failed to register app' });
+    }
   });
-});
 
-export default router;
+  // List the current user's registered apps
+  router.get('/', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const apps = await db
+        .selectFrom('apps')
+        .select(['app_id', 'name', 'domain', 'api_key', 'status', 'created_at', 'updated_at'])
+        .where('creator_did', '=', agent.assertDid)
+        .orderBy('created_at', 'desc')
+        .execute();
+
+      return res.json({ apps });
+    } catch (err) {
+      console.error('Error listing apps:', err);
+      return res.status(500).json({ error: 'Failed to list apps' });
+    }
+  });
+
+  // Get a single app by ID (must be the creator)
+  router.get('/:appId', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const app = await db
+        .selectFrom('apps')
+        .select(['app_id', 'name', 'domain', 'api_key', 'status', 'created_at', 'updated_at'])
+        .where('app_id', '=', req.params.appId)
+        .where('creator_did', '=', agent.assertDid)
+        .executeTakeFirst();
+
+      if (!app) {
+        return res.status(404).json({ error: 'App not found' });
+      }
+
+      return res.json({ app });
+    } catch (err) {
+      console.error('Error getting app:', err);
+      return res.status(500).json({ error: 'Failed to get app' });
+    }
+  });
+
+  // Update an app (name and/or domain)
+  router.put('/:appId', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const { name, domain } = req.body;
+      if (!name && !domain) {
+        return res.status(400).json({ error: 'Provide at least one field to update: name, domain' });
+      }
+
+      const existing = await db
+        .selectFrom('apps')
+        .selectAll()
+        .where('app_id', '=', req.params.appId)
+        .where('creator_did', '=', agent.assertDid)
+        .executeTakeFirst();
+      if (!existing) {
+        return res.status(404).json({ error: 'App not found' });
+      }
+
+      if (domain && domain !== existing.domain) {
+        const conflict = await db
+          .selectFrom('apps')
+          .selectAll()
+          .where('domain', '=', domain)
+          .where('status', '=', 'active')
+          .where('app_id', '!=', req.params.appId)
+          .executeTakeFirst();
+        if (conflict) {
+          return res.status(409).json({ error: 'An active app with this domain already exists' });
+        }
+      }
+
+      const updateValues: Record<string, any> = { updated_at: new Date() };
+      if (name) updateValues.name = name;
+      if (domain) updateValues.domain = domain;
+
+      await db
+        .updateTable('apps')
+        .set(updateValues)
+        .where('app_id', '=', req.params.appId)
+        .where('creator_did', '=', agent.assertDid)
+        .execute();
+
+      return res.json({ success: true });
+    } catch (err) {
+      console.error('Error updating app:', err);
+      return res.status(500).json({ error: 'Failed to update app' });
+    }
+  });
+
+  // Deactivate an app
+  router.delete('/:appId', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const result = await db
+        .updateTable('apps')
+        .set({ status: 'inactive', updated_at: new Date() })
+        .where('app_id', '=', req.params.appId)
+        .where('creator_did', '=', agent.assertDid)
+        .where('status', '=', 'active')
+        .executeTakeFirst();
+
+      if (!result.numUpdatedRows || result.numUpdatedRows === 0n) {
+        return res.status(404).json({ error: 'App not found or already inactive' });
+      }
+
+      return res.json({ success: true, message: 'App deactivated' });
+    } catch (err) {
+      console.error('Error deleting app:', err);
+      return res.status(500).json({ error: 'Failed to delete app' });
+    }
+  });
+
+  // Rotate API key (generates new key, invalidates old one)
+  router.post('/:appId/rotate-key', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const existing = await db
+        .selectFrom('apps')
+        .selectAll()
+        .where('app_id', '=', req.params.appId)
+        .where('creator_did', '=', agent.assertDid)
+        .where('status', '=', 'active')
+        .executeTakeFirst();
+      if (!existing) {
+        return res.status(404).json({ error: 'App not found or inactive' });
+      }
+
+      const newApiKey = `osc_${crypto.randomBytes(32).toString('hex')}`;
+
+      await db
+        .updateTable('apps')
+        .set({
+          api_key: newApiKey,
+          updated_at: new Date(),
+        })
+        .where('app_id', '=', req.params.appId)
+        .execute();
+
+      return res.json({
+        api_key: newApiKey,
+        message: 'Store the new api_key securely. The old key is now invalid.',
+      });
+    } catch (err) {
+      console.error('Error rotating key:', err);
+      return res.status(500).json({ error: 'Failed to rotate API key' });
+    }
+  });
+
+  // Verify API key (for external apps to test credentials)
+  router.post('/verify', async (req: Request, res: Response) => {
+    try {
+      const apiKey = req.headers['x-api-key'] as string;
+
+      if (!apiKey) {
+        return res.status(401).json({ error: 'API key required (X-Api-Key header)' });
+      }
+
+      const app = await db
+        .selectFrom('apps')
+        .selectAll()
+        .where('api_key', '=', apiKey)
+        .where('status', '=', 'active')
+        .executeTakeFirst();
+      if (!app) {
+        return res.status(401).json({ error: 'Invalid API key' });
+      }
+
+      return res.json({
+        valid: true,
+        app: {
+          app_id: app.app_id,
+          name: app.name,
+          domain: app.domain,
+        },
+      });
+    } catch (err) {
+      console.error('Error verifying credentials:', err);
+      return res.status(500).json({ error: 'Failed to verify credentials' });
+    }
+  });
+
+  return router;
+}
