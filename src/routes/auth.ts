@@ -60,6 +60,21 @@ function blobToUrl(blob: any, did: string, pdsHost: string): string | undefined 
   return undefined;
 }
 
+/**
+ * Fetch the Bluesky profile avatar for a DID as a fallback
+ * when no custom community avatar is set.
+ */
+async function fetchBlueskyAvatar(did: string): Promise<string | undefined> {
+  try {
+    const publicAgent = new BskyAgent({ service: 'https://public.api.bsky.app' });
+    const profile = await publicAgent.getProfile({ actor: did });
+    return profile.data.avatar || undefined;
+  } catch (err) {
+    console.warn(`Could not fetch Bluesky avatar for ${did}:`, err instanceof Error ? err.message : err);
+    return undefined;
+  }
+}
+
 function ifString(val: unknown): string | undefined {
   return typeof val === 'string' && val.length > 0 ? val : undefined;
 }
@@ -281,7 +296,8 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
               const profileValue = profileResponse.data.value as CommunityProfile;
 
-              const avatarUrl = blobToUrl(profileValue.avatar, communityDid, community.pds_host);
+              const avatarUrl = blobToUrl(profileValue.avatar, communityDid, community.pds_host)
+                || await fetchBlueskyAvatar(communityDid);
 
               // Check if community has confirmed this membership via membershipProof
               const proofsResponse = await communityAgent.api.com.atproto.repo.listRecords({
@@ -578,7 +594,8 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       const profileValue = profileResponse.data.value as CommunityProfile;
 
-      const avatarUrl = blobToUrl(profileValue.avatar, communityDid, community.pds_host);
+      const avatarUrl = blobToUrl(profileValue.avatar, communityDid, community.pds_host)
+        || await fetchBlueskyAvatar(communityDid);
 
       // Count members (membership proofs)
       const proofsResponse = await communityAgent.api.com.atproto.repo.listRecords({
