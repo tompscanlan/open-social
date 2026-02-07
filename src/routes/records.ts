@@ -11,6 +11,7 @@ import { isAdminInList } from '../lib/adminUtils';
  */
 const ADMIN_ONLY_COLLECTIONS = new Set([
   'community.opensocial.listitem.status',
+  'app.collectivesocial.group.listitem.status',
   'community.opensocial.profile',
   'community.opensocial.admins',
 ]);
@@ -21,7 +22,9 @@ const ADMIN_ONLY_COLLECTIONS = new Set([
  */
 const ADMIN_UPDATE_COLLECTIONS = new Set([
   'community.opensocial.list',
+  'app.collectivesocial.group.list',
   'community.opensocial.listitem.status',
+  'app.collectivesocial.group.listitem.status',
   'community.opensocial.profile',
   'community.opensocial.admins',
 ]);
@@ -97,18 +100,16 @@ export function createRecordsRouter(db: Kysely<Database>) {
 
       const communityAgent = await createCommunityAgent(db, did);
 
-      // Verify membership
+      // Verify membership (admins are implicitly members)
       const memberCheck = await isMember(communityAgent, did, user_did);
-      if (!memberCheck) {
+      const adminCheck = await isAdmin(communityAgent, did, user_did);
+      if (!memberCheck && !adminCheck) {
         return res.status(403).json({ error: 'User is not a member of this community' });
       }
 
       // Check admin-only collections
-      if (ADMIN_ONLY_COLLECTIONS.has(collection)) {
-        const adminCheck = await isAdmin(communityAgent, did, user_did);
-        if (!adminCheck) {
-          return res.status(403).json({ error: 'Only admins can write to this collection' });
-        }
+      if (ADMIN_ONLY_COLLECTIONS.has(collection) && !adminCheck) {
+        return res.status(403).json({ error: 'Only admins can write to this collection' });
       }
 
       // Create the record in the community's repo
@@ -161,18 +162,16 @@ export function createRecordsRouter(db: Kysely<Database>) {
 
       const communityAgent = await createCommunityAgent(db, did);
 
-      // Verify membership
+      // Verify membership (admins are implicitly members)
       const memberCheck = await isMember(communityAgent, did, user_did);
-      if (!memberCheck) {
+      const adminCheck = await isAdmin(communityAgent, did, user_did);
+      if (!memberCheck && !adminCheck) {
         return res.status(403).json({ error: 'User is not a member of this community' });
       }
 
       // Check admin-update collections
-      if (ADMIN_UPDATE_COLLECTIONS.has(collection)) {
-        const adminCheck = await isAdmin(communityAgent, did, user_did);
-        if (!adminCheck) {
-          return res.status(403).json({ error: 'Only admins can update records in this collection' });
-        }
+      if (ADMIN_UPDATE_COLLECTIONS.has(collection) && !adminCheck) {
+        return res.status(403).json({ error: 'Only admins can update records in this collection' });
       }
 
       const response = await communityAgent.api.com.atproto.repo.putRecord({
@@ -224,18 +223,16 @@ export function createRecordsRouter(db: Kysely<Database>) {
 
       const communityAgent = await createCommunityAgent(db, did);
 
-      // Verify membership
+      // Verify membership (admins are implicitly members)
       const memberCheck = await isMember(communityAgent, did, user_did);
-      if (!memberCheck) {
+      const adminCheck = await isAdmin(communityAgent, did, user_did);
+      if (!memberCheck && !adminCheck) {
         return res.status(403).json({ error: 'User is not a member of this community' });
       }
 
       // Admin-only or admin-update collections need admin check for deletion
-      if (ADMIN_ONLY_COLLECTIONS.has(collection) || ADMIN_UPDATE_COLLECTIONS.has(collection)) {
-        const adminCheck = await isAdmin(communityAgent, did, user_did);
-        if (!adminCheck) {
-          return res.status(403).json({ error: 'Only admins can delete records in this collection' });
-        }
+      if ((ADMIN_ONLY_COLLECTIONS.has(collection) || ADMIN_UPDATE_COLLECTIONS.has(collection)) && !adminCheck) {
+        return res.status(403).json({ error: 'Only admins can delete records in this collection' });
       }
 
       await communityAgent.api.com.atproto.repo.deleteRecord({
@@ -357,13 +354,16 @@ export function createRecordsRouter(db: Kysely<Database>) {
 
       const communityAgent = await createCommunityAgent(db, did);
 
+      // Check member and admin status independently.
+      // Admins are always considered members even if they lack a membershipProof
+      // (e.g. community created before proof records were introduced).
       const memberCheck = await isMember(communityAgent, did, user_did);
-      let adminCheck = false;
-      if (memberCheck) {
-        adminCheck = await isAdmin(communityAgent, did, user_did);
-      }
+      const adminCheck = await isAdmin(communityAgent, did, user_did);
 
-      res.json({ is_member: memberCheck, is_admin: adminCheck });
+      res.json({
+        is_member: memberCheck || adminCheck,
+        is_admin: adminCheck,
+      });
     } catch (error: any) {
       console.error('Error checking membership:', error);
       res.status(500).json({ error: error.message || 'Failed to check membership' });
