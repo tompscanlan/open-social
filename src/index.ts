@@ -9,6 +9,7 @@ import { createAuthRouter } from './routes/auth';
 import { createAppRouter } from './routes/apps';
 import { createCommunityRouter } from './routes/communities';
 import { createMemberRouter } from './routes/members';
+import { createRecordsRouter } from './routes/records';
 
 dotenv.config();
 
@@ -111,6 +112,7 @@ async function start() {
     app.use('/api/v1/apps', createAppRouter(oauthClient, db));
     app.use('/api/v1/communities', createCommunityRouter(db));
     app.use('/api/v1/communities', createMemberRouter(db));
+    app.use('/api/v1/communities', createRecordsRouter(db));
 
     // Error handling
     app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {

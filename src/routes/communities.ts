@@ -5,6 +5,7 @@ import type { Kysely } from 'kysely';
 import type { Database } from '../db';
 import { createVerifyApiKey, AuthenticatedRequest } from '../middleware/auth';
 import { getPublicAgent } from '../services/atproto';
+import { isAdminInList, normalizeAdmins } from '../lib/adminUtils';
 
 export function createCommunityRouter(db: Kysely<Database>) {
   const router = Router();
@@ -173,24 +174,43 @@ export function createCommunityRouter(db: Kysely<Database>) {
       const result = await Promise.all(
         communities.map(async (community) => {
           let is_admin = false;
+          let communityType = 'open';
 
-          if (user_did) {
+          try {
+            const agent = await getPublicAgent(community.pds_host);
+
+            // Fetch profile to get community type
             try {
-              const agent = await getPublicAgent(community.pds_host);
-              const adminRecord = await agent.com.atproto.repo.getRecord({
+              const profileRecord = await agent.com.atproto.repo.getRecord({
                 repo: community.did,
-                collection: 'community.opensocial.admins',
+                collection: 'community.opensocial.profile',
                 rkey: 'self',
               });
-
-              const admins = (adminRecord.data.value as any).admins || [];
-              is_admin = admins.some((admin: any) => admin.did === user_did);
+              const profile = profileRecord.data.value as any;
+              communityType = profile.type || 'open';
             } catch (error) {
-              console.error(`Error checking admin status for ${community.handle}`);
+              // Profile fetch failed — default to open
             }
+
+            if (user_did) {
+              try {
+                const adminRecord = await agent.com.atproto.repo.getRecord({
+                  repo: community.did,
+                  collection: 'community.opensocial.admins',
+                  rkey: 'self',
+                });
+
+                const admins = (adminRecord.data.value as any).admins || [];
+                is_admin = isAdminInList(user_did as string, admins);
+              } catch (error) {
+                console.error(`Error checking admin status for ${community.handle}`);
+              }
+            }
+          } catch (error) {
+            console.error(`Error fetching data for ${community.handle}`);
           }
 
-          return { ...community, is_admin };
+          return { ...community, is_admin, type: communityType };
         })
       );
 
@@ -247,6 +267,7 @@ export function createCommunityRouter(db: Kysely<Database>) {
           display_name: profile.displayName,
           description: profile.description,
           guidelines: profile.guidelines,
+          type: profile.type || 'open',
           admins,
           created_at: profile.createdAt,
         },
@@ -292,7 +313,7 @@ export function createCommunityRouter(db: Kysely<Database>) {
       const admins = (adminRecord.data.value as any).admins || [];
 
       // Check if user is an admin
-      const isAdmin = admins.some((admin: any) => admin.did === user_did);
+      const isAdmin = isAdminInList(user_did, admins);
       if (!isAdmin) {
         return res.status(403).json({
           error: 'Only admins can delete a community',

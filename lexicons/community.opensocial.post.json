@@ -1,0 +1,54 @@
+{
+  "lexicon": 1,
+  "id": "community.opensocial.post",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A discussion post within a community, optionally linked to a segment or list item. Supports threaded replies via parentPostUri.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["text", "authorDid", "createdAt"],
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 5000,
+            "description": "The post content"
+          },
+          "segmentUri": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the community.opensocial.segment this post discusses"
+          },
+          "listItemUri": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the community.opensocial.listitem this post discusses (when not tied to a specific segment)"
+          },
+          "parentPostUri": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the parent post (for threaded replies)"
+          },
+          "authorDid": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the member who wrote this post"
+          },
+          "mentionedDids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "did"
+            },
+            "description": "DIDs of members mentioned in this post (for notifications)"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

@@ -8,6 +8,9 @@ import multer from 'multer';
 import { config } from '../config';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
+import { ensureServiceUrl } from '../services/atproto';
+import { isAdminInList, getOriginalAdminDid, normalizeAdmins } from '../lib/adminUtils';
+import { createCommunityAgent } from '../services/atproto';
 
 // Configure multer for file uploads
 const upload = multer({
@@ -46,15 +49,17 @@ function blobToUrl(blob: any, did: string, pdsHost: string): string | undefined 
   if (!blob) return undefined;
   if (typeof blob === 'string') return blob;
   
+  const serviceUrl = ensureServiceUrl(pdsHost);
+
   // Handle BlobRef object from @atproto/api
   if (blob.ref) {
     const cid = typeof blob.ref === 'string' ? blob.ref : blob.ref.toString();
-    return `${pdsHost}/xrpc/com.atproto.sync.getBlob?did=${did}&cid=${cid}`;
+    return `${serviceUrl}/xrpc/com.atproto.sync.getBlob?did=${did}&cid=${cid}`;
   }
   
   // Handle plain blob object with $type
   if (blob.$type === 'blob' && blob.ref?.$link) {
-    return `${pdsHost}/xrpc/com.atproto.sync.getBlob?did=${did}&cid=${blob.ref.$link}`;
+    return `${serviceUrl}/xrpc/com.atproto.sync.getBlob?did=${did}&cid=${blob.ref.$link}`;
   }
   
   return undefined;
@@ -280,7 +285,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
             }
 
             // Create agent for the community
-            const communityAgent = new BskyAgent({ service: community.pds_host });
+            const communityAgent = new BskyAgent({ service: ensureServiceUrl(community.pds_host) });
             await communityAgent.login({
               identifier: community.handle,
               password: community.app_password,
@@ -505,8 +510,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
           rkey: 'self',
           record: {
             $type: 'community.opensocial.admins',
-            admins: [agent.assertDid],
-            createdAt: new Date().toISOString(),
+            admins: [{ did: agent.assertDid, addedAt: new Date().toISOString() }],
           },
         });
       } catch (err) {
@@ -535,7 +539,9 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         collection: 'community.opensocial.membershipProof',
         record: {
           $type: 'community.opensocial.membershipProof',
+          memberDid: agent.assertDid,
           cid: membershipRecord.data.cid,
+          confirmedAt: new Date().toISOString(),
         },
       });
 
@@ -579,7 +585,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       }
 
       // Create community agent
-      const communityAgent = new BskyAgent({ service: community.pds_host });
+      const communityAgent = new BskyAgent({ service: ensureServiceUrl(community.pds_host) });
       await communityAgent.login({
         identifier: community.handle,
         password: community.app_password,
@@ -612,8 +618,8 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         rkey: 'self',
       });
 
-      const adminsValue = adminsResponse.data.value as { admins: string[] };
-      const isAdmin = adminsValue.admins.includes(agent.assertDid);
+      const adminsValue = (adminsResponse.data.value as any).admins || [];
+      const isAdmin = isAdminInList(agent.assertDid, adminsValue);
 
       // Get user's role from their membership record
       const membershipResponse = await agent.api.com.atproto.repo.listRecords({
@@ -671,7 +677,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       }
 
       // Check if user is admin
-      const communityAgent = new BskyAgent({ service: community.pds_host });
+      const communityAgent = new BskyAgent({ service: ensureServiceUrl(community.pds_host) });
       await communityAgent.login({
         identifier: community.handle,
         password: community.app_password,
@@ -683,8 +689,8 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         rkey: 'self',
       });
 
-      const adminsValue = adminsResponse.data.value as { admins: string[] };
-      if (!adminsValue.admins.includes(agent.assertDid)) {
+      const adminsListAvatar = (adminsResponse.data.value as any).admins || [];
+      if (!isAdminInList(agent.assertDid, adminsListAvatar)) {
         return res.status(403).json({ error: 'Not authorized. Must be an admin.' });
       }
 
@@ -764,7 +770,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       }
 
       // Create community agent
-      const communityAgent = new BskyAgent({ service: community.pds_host });
+      const communityAgent = new BskyAgent({ service: ensureServiceUrl(community.pds_host) });
       await communityAgent.login({
         identifier: community.handle,
         password: community.app_password,
@@ -777,8 +783,8 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         rkey: 'self',
       });
 
-      const adminsValue = adminsResponse.data.value as { admins: string[] };
-      if (!adminsValue.admins.includes(agent.assertDid)) {
+      const adminsListProfile = (adminsResponse.data.value as any).admins || [];
+      if (!isAdminInList(agent.assertDid, adminsListProfile)) {
         return res.status(403).json({ error: 'Not authorized. Must be an admin.' });
       }
 
@@ -839,7 +845,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       }
 
       // Create agent for the community
-      const communityAgent = new BskyAgent({ service: community.pds_host });
+      const communityAgent = new BskyAgent({ service: ensureServiceUrl(community.pds_host) });
       await communityAgent.login({
         identifier: community.handle,
         password: community.app_password,
@@ -855,8 +861,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       const admins = (adminRecord.data.value as any).admins || [];
 
       // Check if user is an admin
-      const isAdmin = admins.some((admin: any) => admin.did === userDid);
-      if (!isAdmin) {
+      if (!isAdminInList(userDid, admins)) {
         return res.status(403).json({
           error: 'Only admins can delete a community',
         });
@@ -884,6 +889,344 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       return res.status(500).json({ 
         error: 'Failed to delete community',
         details: err instanceof Error ? err.message : 'Unknown error'
+      });
+    }
+  });
+
+  // ── Admin member management routes ─────────────────────────────────────
+
+  // List all group members (admin only), with optional ?search= DID filter
+  router.get('/communities/:did/members', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const communityDid = decodeURIComponent(req.params.did);
+      const search = req.query.search as string | undefined;
+
+      // Get community from database
+      const community = await db
+        .selectFrom('communities')
+        .selectAll()
+        .where('did', '=', communityDid)
+        .executeTakeFirst();
+
+      if (!community) {
+        return res.status(404).json({ error: 'Community not found' });
+      }
+
+      // Create community agent
+      const communityAgent = await createCommunityAgent(db, communityDid);
+
+      // Verify caller is an admin
+      const adminsResponse = await communityAgent.api.com.atproto.repo.getRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.admins',
+        rkey: 'self',
+      });
+
+      const admins = (adminsResponse.data.value as any).admins || [];
+      if (!isAdminInList(agent.assertDid, admins)) {
+        return res.status(403).json({ error: 'Not authorized. Must be an admin.' });
+      }
+
+      // List all membershipProof records (paginated)
+      let cursor: string | undefined;
+      const allProofs: any[] = [];
+      do {
+        const response = await communityAgent.api.com.atproto.repo.listRecords({
+          repo: communityDid,
+          collection: 'community.opensocial.membershipProof',
+          limit: 100,
+          cursor,
+        });
+        allProofs.push(...response.data.records);
+        cursor = response.data.cursor;
+      } while (cursor);
+
+      // Build member list
+      let members = allProofs.map((record: any) => ({
+        uri: record.uri,
+        did: record.value.memberDid || null,
+        cid: record.value.cid,
+        confirmedAt: record.value.confirmedAt || null,
+        isAdmin: record.value.memberDid
+          ? isAdminInList(record.value.memberDid, admins)
+          : false,
+      }));
+
+      // Filter by DID search
+      if (search) {
+        members = members.filter(
+          (m) => m.did && m.did.toLowerCase().includes(search.toLowerCase())
+        );
+      }
+
+      return res.json({ members, total: members.length });
+    } catch (err) {
+      console.error('Failed to list members:', err);
+      return res.status(500).json({
+        error: 'Failed to list members',
+        details: err instanceof Error ? err.message : 'Unknown error',
+      });
+    }
+  });
+
+  // Promote a member to admin
+  router.post('/communities/:did/members/:memberDid/admin', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const communityDid = decodeURIComponent(req.params.did);
+      const memberDid = decodeURIComponent(req.params.memberDid);
+
+      const community = await db
+        .selectFrom('communities')
+        .selectAll()
+        .where('did', '=', communityDid)
+        .executeTakeFirst();
+
+      if (!community) {
+        return res.status(404).json({ error: 'Community not found' });
+      }
+
+      const communityAgent = await createCommunityAgent(db, communityDid);
+
+      // Verify caller is an admin
+      const adminsResponse = await communityAgent.api.com.atproto.repo.getRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.admins',
+        rkey: 'self',
+      });
+
+      const admins = (adminsResponse.data.value as any).admins || [];
+      if (!isAdminInList(agent.assertDid, admins)) {
+        return res.status(403).json({ error: 'Not authorized. Must be an admin.' });
+      }
+
+      // Check if already an admin
+      if (isAdminInList(memberDid, admins)) {
+        return res.status(409).json({ error: 'Member is already an admin.' });
+      }
+
+      // Verify the member has a membershipProof in this community
+      let cursor: string | undefined;
+      let found = false;
+      do {
+        const response = await communityAgent.api.com.atproto.repo.listRecords({
+          repo: communityDid,
+          collection: 'community.opensocial.membershipProof',
+          limit: 100,
+          cursor,
+        });
+        found = response.data.records.some(
+          (r: any) => r.value.memberDid === memberDid
+        );
+        cursor = response.data.cursor;
+      } while (cursor && !found);
+
+      if (!found) {
+        return res.status(404).json({ error: 'Member not found in this community.' });
+      }
+
+      // Add member to admin list (normalize to canonical format)
+      const updatedAdmins = normalizeAdmins(admins);
+      updatedAdmins.push({ did: memberDid, addedAt: new Date().toISOString() });
+
+      await communityAgent.api.com.atproto.repo.putRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.admins',
+        rkey: 'self',
+        record: {
+          $type: 'community.opensocial.admins',
+          admins: updatedAdmins,
+        },
+      });
+
+      return res.json({ success: true, admins: updatedAdmins });
+    } catch (err) {
+      console.error('Failed to promote member to admin:', err);
+      return res.status(500).json({
+        error: 'Failed to promote member to admin',
+        details: err instanceof Error ? err.message : 'Unknown error',
+      });
+    }
+  });
+
+  // Demote an admin (cannot demote the original group creator)
+  router.delete('/communities/:did/members/:memberDid/admin', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const communityDid = decodeURIComponent(req.params.did);
+      const memberDid = decodeURIComponent(req.params.memberDid);
+
+      const community = await db
+        .selectFrom('communities')
+        .selectAll()
+        .where('did', '=', communityDid)
+        .executeTakeFirst();
+
+      if (!community) {
+        return res.status(404).json({ error: 'Community not found' });
+      }
+
+      const communityAgent = await createCommunityAgent(db, communityDid);
+
+      // Verify caller is an admin
+      const adminsResponse = await communityAgent.api.com.atproto.repo.getRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.admins',
+        rkey: 'self',
+      });
+
+      const admins = (adminsResponse.data.value as any).admins || [];
+      if (!isAdminInList(agent.assertDid, admins)) {
+        return res.status(403).json({ error: 'Not authorized. Must be an admin.' });
+      }
+
+      // Protect the original group creator
+      const originalAdminDid = getOriginalAdminDid(admins);
+      if (memberDid === originalAdminDid) {
+        return res.status(403).json({
+          error: 'Cannot demote the original group creator.',
+        });
+      }
+
+      // Verify the target is actually an admin
+      if (!isAdminInList(memberDid, admins)) {
+        return res.status(404).json({ error: 'Member is not an admin.' });
+      }
+
+      // Remove from admin list
+      const updatedAdmins = normalizeAdmins(admins).filter(
+        (a) => a.did !== memberDid
+      );
+
+      await communityAgent.api.com.atproto.repo.putRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.admins',
+        rkey: 'self',
+        record: {
+          $type: 'community.opensocial.admins',
+          admins: updatedAdmins,
+        },
+      });
+
+      return res.json({ success: true, admins: updatedAdmins });
+    } catch (err) {
+      console.error('Failed to demote admin:', err);
+      return res.status(500).json({
+        error: 'Failed to demote admin',
+        details: err instanceof Error ? err.message : 'Unknown error',
+      });
+    }
+  });
+
+  // Remove a member from the group by deleting their membershipProof
+  router.delete('/communities/:did/members/:memberDid', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const communityDid = decodeURIComponent(req.params.did);
+      const memberDid = decodeURIComponent(req.params.memberDid);
+
+      const community = await db
+        .selectFrom('communities')
+        .selectAll()
+        .where('did', '=', communityDid)
+        .executeTakeFirst();
+
+      if (!community) {
+        return res.status(404).json({ error: 'Community not found' });
+      }
+
+      const communityAgent = await createCommunityAgent(db, communityDid);
+
+      // Verify caller is an admin
+      const adminsResponse = await communityAgent.api.com.atproto.repo.getRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.admins',
+        rkey: 'self',
+      });
+
+      const admins = (adminsResponse.data.value as any).admins || [];
+      if (!isAdminInList(agent.assertDid, admins)) {
+        return res.status(403).json({ error: 'Not authorized. Must be an admin.' });
+      }
+
+      // Prevent removing the original group creator
+      const originalAdminDid = getOriginalAdminDid(admins);
+      if (memberDid === originalAdminDid) {
+        return res.status(403).json({
+          error: 'Cannot remove the original group creator.',
+        });
+      }
+
+      // Find the membershipProof record for this member
+      let cursor: string | undefined;
+      let memberProof: any = null;
+      do {
+        const response = await communityAgent.api.com.atproto.repo.listRecords({
+          repo: communityDid,
+          collection: 'community.opensocial.membershipProof',
+          limit: 100,
+          cursor,
+        });
+        memberProof = response.data.records.find(
+          (r: any) => r.value.memberDid === memberDid
+        );
+        cursor = response.data.cursor;
+      } while (cursor && !memberProof);
+
+      if (!memberProof) {
+        return res.status(404).json({ error: 'Member not found in this community.' });
+      }
+
+      // Delete the membershipProof record
+      const rkey = memberProof.uri.split('/').pop()!;
+      await communityAgent.api.com.atproto.repo.deleteRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.membershipProof',
+        rkey,
+      });
+
+      // If the removed member was also an admin, remove them from the admin list
+      if (isAdminInList(memberDid, admins)) {
+        const updatedAdmins = normalizeAdmins(admins).filter(
+          (a) => a.did !== memberDid
+        );
+        await communityAgent.api.com.atproto.repo.putRecord({
+          repo: communityDid,
+          collection: 'community.opensocial.admins',
+          rkey: 'self',
+          record: {
+            $type: 'community.opensocial.admins',
+            admins: updatedAdmins,
+          },
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: `Member ${memberDid} removed from community. Their membership record remains in their PDS but is no longer verified.`,
+      });
+    } catch (err) {
+      console.error('Failed to remove member:', err);
+      return res.status(500).json({
+        error: 'Failed to remove member',
+        details: err instanceof Error ? err.message : 'Unknown error',
       });
     }
   });
