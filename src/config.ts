@@ -14,4 +14,5 @@ export const config = {
     : [],
   pdsUrl: process.env.PDS_URL || 'https://bsky.social',
   cookieSecret: process.env.COOKIE_SECRET || 'open-social-default-secret-change-in-production',
+  encryptionKey: process.env.ENCRYPTION_KEY || '',
 } as const;

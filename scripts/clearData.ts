@@ -35,6 +35,7 @@ import { BskyAgent } from '@atproto/api';
 import { Kysely, PostgresDialect } from 'kysely';
 import { Pool } from 'pg';
 import type { Database } from '../src/db';
+import { decryptIfNeeded } from '../src/lib/crypto';
 
 dotenv.config();
 
@@ -249,7 +250,7 @@ async function clearCommunityData(
   const agent = new BskyAgent({ service: pdsServiceUrl(community.pds_host) });
   await agent.login({
     identifier: community.handle,
-    password: community.app_password,
+    password: decryptIfNeeded(community.app_password),
   });
   console.log('🔑 Authenticated as community account.\n');
 

@@ -1,6 +1,7 @@
 import { BskyAgent, AtpAgent } from '@atproto/api';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
+import { decryptIfNeeded } from '../lib/crypto';
 
 /** Ensure a PDS host string is a full URL with scheme. */
 export function ensureServiceUrl(pdsHost: string): string {
@@ -25,7 +26,7 @@ export async function createCommunityAgent(db: Kysely<Database>, did: string): P
   
   await agent.login({
     identifier: community.handle,
-    password: community.app_password,
+    password: decryptIfNeeded(community.app_password),
   });
 
   return agent;

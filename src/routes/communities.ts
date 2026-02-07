@@ -6,6 +6,7 @@ import type { Database } from '../db';
 import { createVerifyApiKey, AuthenticatedRequest } from '../middleware/auth';
 import { getPublicAgent } from '../services/atproto';
 import { isAdminInList, normalizeAdmins } from '../lib/adminUtils';
+import { encrypt } from '../lib/crypto';
 
 export function createCommunityRouter(db: Kysely<Database>) {
   const router = Router();
@@ -136,7 +137,7 @@ export function createCommunityRouter(db: Kysely<Database>) {
           handle,
           display_name: display_name,
           pds_host: pdsHost,
-          app_password: accountPassword,
+          app_password: encrypt(accountPassword),
         })
         .returningAll()
         .executeTakeFirstOrThrow();

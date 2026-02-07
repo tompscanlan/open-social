@@ -8,9 +8,9 @@ import multer from 'multer';
 import { config } from '../config';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
-import { ensureServiceUrl } from '../services/atproto';
+import { ensureServiceUrl, createCommunityAgent } from '../services/atproto';
 import { isAdminInList, getOriginalAdminDid, normalizeAdmins } from '../lib/adminUtils';
-import { createCommunityAgent } from '../services/atproto';
+import { encrypt, decryptIfNeeded } from '../lib/crypto';
 
 // Configure multer for file uploads
 const upload = multer({
@@ -49,17 +49,15 @@ function blobToUrl(blob: any, did: string, pdsHost: string): string | undefined 
   if (!blob) return undefined;
   if (typeof blob === 'string') return blob;
   
-  const serviceUrl = ensureServiceUrl(pdsHost);
-
   // Handle BlobRef object from @atproto/api
   if (blob.ref) {
     const cid = typeof blob.ref === 'string' ? blob.ref : blob.ref.toString();
-    return `${serviceUrl}/xrpc/com.atproto.sync.getBlob?did=${did}&cid=${cid}`;
+    return `${pdsHost}/xrpc/com.atproto.sync.getBlob?did=${did}&cid=${cid}`;
   }
   
   // Handle plain blob object with $type
   if (blob.$type === 'blob' && blob.ref?.$link) {
-    return `${serviceUrl}/xrpc/com.atproto.sync.getBlob?did=${did}&cid=${blob.ref.$link}`;
+    return `${pdsHost}/xrpc/com.atproto.sync.getBlob?did=${did}&cid=${blob.ref.$link}`;
   }
   
   return undefined;
@@ -285,10 +283,10 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
             }
 
             // Create agent for the community
-            const communityAgent = new BskyAgent({ service: ensureServiceUrl(community.pds_host) });
+            const communityAgent = new BskyAgent({ service: community.pds_host });
             await communityAgent.login({
               identifier: community.handle,
-              password: community.app_password,
+              password: decryptIfNeeded(community.app_password),
             });
 
             // Fetch community profile using the community's own agent
@@ -424,7 +422,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         });
         communityAgent = bskyAgent;
 
-        // Store password in database (encrypted in production!)
+        // Store password in database (encrypted at rest)
         await db
           .insertInto('communities')
           .values({
@@ -432,7 +430,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
             handle: communityHandle,
             display_name: displayName,
             pds_host: pdsHost,
-            app_password: accountPassword,
+            app_password: encrypt(accountPassword),
             created_at: new Date(),
           })
           .execute();
@@ -471,7 +469,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
             handle: communityHandle,
             display_name: displayName,
             pds_host: pdsHost,
-            app_password: appPassword,
+            app_password: encrypt(appPassword),
             created_at: new Date(),
           })
           .execute();
@@ -510,7 +508,8 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
           rkey: 'self',
           record: {
             $type: 'community.opensocial.admins',
-            admins: [{ did: agent.assertDid, addedAt: new Date().toISOString() }],
+            admins: [agent.assertDid],
+            createdAt: new Date().toISOString(),
           },
         });
       } catch (err) {
@@ -539,9 +538,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         collection: 'community.opensocial.membershipProof',
         record: {
           $type: 'community.opensocial.membershipProof',
-          memberDid: agent.assertDid,
           cid: membershipRecord.data.cid,
-          confirmedAt: new Date().toISOString(),
         },
       });
 
@@ -585,10 +582,10 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       }
 
       // Create community agent
-      const communityAgent = new BskyAgent({ service: ensureServiceUrl(community.pds_host) });
+      const communityAgent = new BskyAgent({ service: community.pds_host });
       await communityAgent.login({
         identifier: community.handle,
-        password: community.app_password,
+        password: decryptIfNeeded(community.app_password),
       });
 
       // Fetch community profile
@@ -618,8 +615,8 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         rkey: 'self',
       });
 
-      const adminsValue = (adminsResponse.data.value as any).admins || [];
-      const isAdmin = isAdminInList(agent.assertDid, adminsValue);
+      const adminsValue = adminsResponse.data.value as { admins: string[] };
+      const isAdmin = adminsValue.admins.includes(agent.assertDid);
 
       // Get user's role from their membership record
       const membershipResponse = await agent.api.com.atproto.repo.listRecords({
@@ -677,10 +674,10 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       }
 
       // Check if user is admin
-      const communityAgent = new BskyAgent({ service: ensureServiceUrl(community.pds_host) });
+      const communityAgent = new BskyAgent({ service: community.pds_host });
       await communityAgent.login({
         identifier: community.handle,
-        password: community.app_password,
+        password: decryptIfNeeded(community.app_password),
       });
 
       const adminsResponse = await communityAgent.api.com.atproto.repo.getRecord({
@@ -689,8 +686,8 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         rkey: 'self',
       });
 
-      const adminsListAvatar = (adminsResponse.data.value as any).admins || [];
-      if (!isAdminInList(agent.assertDid, adminsListAvatar)) {
+      const adminsValue = adminsResponse.data.value as { admins: string[] };
+      if (!adminsValue.admins.includes(agent.assertDid)) {
         return res.status(403).json({ error: 'Not authorized. Must be an admin.' });
       }
 
@@ -770,10 +767,10 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       }
 
       // Create community agent
-      const communityAgent = new BskyAgent({ service: ensureServiceUrl(community.pds_host) });
+      const communityAgent = new BskyAgent({ service: community.pds_host });
       await communityAgent.login({
         identifier: community.handle,
-        password: community.app_password,
+        password: decryptIfNeeded(community.app_password),
       });
 
       // Check if user is admin
@@ -783,8 +780,8 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         rkey: 'self',
       });
 
-      const adminsListProfile = (adminsResponse.data.value as any).admins || [];
-      if (!isAdminInList(agent.assertDid, adminsListProfile)) {
+      const adminsValue = adminsResponse.data.value as { admins: string[] };
+      if (!adminsValue.admins.includes(agent.assertDid)) {
         return res.status(403).json({ error: 'Not authorized. Must be an admin.' });
       }
 
@@ -845,10 +842,10 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       }
 
       // Create agent for the community
-      const communityAgent = new BskyAgent({ service: ensureServiceUrl(community.pds_host) });
+      const communityAgent = new BskyAgent({ service: community.pds_host });
       await communityAgent.login({
         identifier: community.handle,
-        password: community.app_password,
+        password: decryptIfNeeded(community.app_password),
       });
 
       // Fetch admins to verify permissions
@@ -861,7 +858,8 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       const admins = (adminRecord.data.value as any).admins || [];
 
       // Check if user is an admin
-      if (!isAdminInList(userDid, admins)) {
+      const isAdmin = admins.some((admin: any) => admin.did === userDid);
+      if (!isAdmin) {
         return res.status(403).json({
           error: 'Only admins can delete a community',
         });

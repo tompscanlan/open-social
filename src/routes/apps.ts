@@ -7,6 +7,7 @@ import crypto from 'crypto';
 import { config } from '../config';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
+import { hashApiKey } from '../lib/crypto';
 
 type Session = { did?: string };
 
@@ -83,7 +84,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
           name,
           domain,
           creator_did: creatorDid,
-          api_key: apiKey,
+          api_key: hashApiKey(apiKey),
           created_at: new Date(),
           updated_at: new Date(),
           status: 'active',
@@ -116,7 +117,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
 
       const apps = await db
         .selectFrom('apps')
-        .select(['app_id', 'name', 'domain', 'api_key', 'status', 'created_at', 'updated_at'])
+        .select(['app_id', 'name', 'domain', 'status', 'created_at', 'updated_at'])
         .where('creator_did', '=', agent.assertDid)
         .orderBy('created_at', 'desc')
         .execute();
@@ -138,7 +139,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
 
       const app = await db
         .selectFrom('apps')
-        .select(['app_id', 'name', 'domain', 'api_key', 'status', 'created_at', 'updated_at'])
+        .select(['app_id', 'name', 'domain', 'status', 'created_at', 'updated_at'])
         .where('app_id', '=', req.params.appId)
         .where('creator_did', '=', agent.assertDid)
         .executeTakeFirst();
@@ -259,7 +260,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
       await db
         .updateTable('apps')
         .set({
-          api_key: newApiKey,
+          api_key: hashApiKey(newApiKey),
           updated_at: new Date(),
         })
         .where('app_id', '=', req.params.appId)
@@ -287,7 +288,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
       const app = await db
         .selectFrom('apps')
         .selectAll()
-        .where('api_key', '=', apiKey)
+        .where('api_key', '=', hashApiKey(apiKey))
         .where('status', '=', 'active')
         .executeTakeFirst();
       if (!app) {

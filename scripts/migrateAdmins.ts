@@ -25,6 +25,7 @@ import { Kysely, PostgresDialect } from 'kysely';
 import { Pool } from 'pg';
 import type { Database } from '../src/db';
 import { normalizeAdmins } from '../src/lib/adminUtils';
+import { decryptIfNeeded } from '../src/lib/crypto';
 
 dotenv.config();
 
@@ -71,7 +72,7 @@ async function main() {
       const agent = new BskyAgent({ service: pdsServiceUrl(community.pds_host) });
       await agent.login({
         identifier: community.handle,
-        password: community.app_password,
+        password: decryptIfNeeded(community.app_password),
       });
 
       // ─── 1. Migrate admins record ─────────────────────────────────────
