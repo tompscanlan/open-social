@@ -11,6 +11,7 @@ import type { Database } from '../db';
 import { ensureServiceUrl, createCommunityAgent } from '../services/atproto';
 import { isAdminInList, getOriginalAdminDid, normalizeAdmins } from '../lib/adminUtils';
 import { encrypt, decryptIfNeeded } from '../lib/crypto';
+import { hasScope, MEMBERSHIP_WRITE_SCOPE, OPENSOCIAL_SCOPES } from '../middleware/auth';
 
 // Configure multer for file uploads
 const upload = multer({
@@ -117,12 +118,32 @@ async function getSessionAgent(
 
   try {
     const oauthSession = await oauthClient.restore(session.did);
-    return oauthSession ? new Agent(oauthSession) : null;
+    if (!oauthSession) return null;
+
+    const agent = new Agent(oauthSession);
+
+    // Attach granted scopes to the agent for downstream permission checks
+    try {
+      const tokenInfo = await oauthSession.getTokenInfo();
+      (agent as any).__grantedScope = tokenInfo.scope;
+    } catch {
+      // If token info unavailable, scope checks will rely on transition:generic fallback
+    }
+
+    return agent;
   } catch (err) {
     console.warn('OAuth restore failed:', err);
     await session.destroy();
     return null;
   }
+}
+
+/**
+ * Get the granted scope string from an agent created by getSessionAgent.
+ * Returns undefined if scopes could not be determined.
+ */
+function getAgentScope(agent: Agent): string | undefined {
+  return (agent as any).__grantedScope;
 }
 
 export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Database>) {
@@ -191,7 +212,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       // Initiate the OAuth flow
       const url = await oauthClient.authorize(input, {
-        scope: 'atproto transition:generic',
+        scope: OPENSOCIAL_SCOPES,
       });
 
       res.redirect(url.toString());
@@ -358,7 +379,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
     }
   });
 
-  // Create a new community
+  // Create a new community (requires an existing AT Protocol account)
   router.post('/users/me/communities', async (req: Request, res: Response) => {
     try {
       const agent = await getSessionAgent(req, res, oauthClient);
@@ -367,116 +388,49 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         return res.status(401).json({ error: 'Not authenticated' });
       }
 
-      const { type, name, displayName, description, did: existingDid, appPassword } = req.body;
+      const { displayName, description, did: existingDid, appPassword } = req.body;
 
       if (!displayName) {
         return res.status(400).json({ error: 'displayName is required' });
       }
 
-      let communityDid: string;
-      let communityHandle: string;
-      let communityAgent: Agent;
-
-      if (type === 'new') {
-        // Create new community on opensocial.community PDS
-        if (!name) {
-          return res.status(400).json({ error: 'name is required for new communities' });
-        }
-
-        const handle = `${name}.opensocial.community`;
-        const pdsHost = config.pdsUrl || 'https://opensocial.community';
-        const accountPassword = crypto.randomBytes(32).toString('hex');
-
-        // Create account on PDS
-        const createResponse = await fetch(`${pdsHost}/xrpc/com.atproto.server.createAccount`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            email: `${name}@opensocial.community`,
-            handle: handle,
-            password: accountPassword,
-          }),
-        });
-
-        if (!createResponse.ok) {
-          const error = await createResponse.json() as { message?: string };
-          console.error('PDS account creation failed:', error);
-          return res.status(500).json({ 
-            error: 'Failed to create PDS account',
-            details: error.message || 'Unknown error'
-          });
-        }
-
-        const accountData = await createResponse.json() as { did: string; handle: string };
-        communityDid = accountData.did;
-        communityHandle = handle;
-
-        // Wait for account to be ready
-        await new Promise(resolve => setTimeout(resolve, 1000));
-
-        // Login as the community
-        const bskyAgent = new BskyAgent({ service: pdsHost });
-        await bskyAgent.login({
-          identifier: handle,
-          password: accountPassword,
-        });
-        communityAgent = bskyAgent;
-
-        // Store password in database (encrypted at rest)
-        await db
-          .insertInto('communities')
-          .values({
-            did: communityDid,
-            handle: communityHandle,
-            display_name: displayName,
-            pds_host: pdsHost,
-            app_password: encrypt(accountPassword),
-            created_at: new Date(),
-          })
-          .execute();
-
-      } else if (type === 'existing') {
-        // Use existing DID with app password
-        if (!existingDid || !appPassword) {
-          return res.status(400).json({ error: 'did and appPassword are required for existing communities' });
-        }
-
-        communityDid = existingDid;
-
-        // Resolve DID to get handle and PDS
-        let pdsHost = 'https://bsky.social';
-        try {
-          const profile = await agent.getProfile({ actor: existingDid });
-          communityHandle = profile.data.handle || existingDid;
-        } catch (e) {
-          console.warn('Could not resolve handle, using DID as fallback');
-          communityHandle = existingDid;
-        }
-
-        // Login with app password
-        const bskyAgent = new BskyAgent({ service: pdsHost });
-        await bskyAgent.login({
-          identifier: existingDid,
-          password: appPassword,
-        });
-        communityAgent = bskyAgent;
-
-        // Store in database
-        await db
-          .insertInto('communities')
-          .values({
-            did: communityDid,
-            handle: communityHandle,
-            display_name: displayName,
-            pds_host: pdsHost,
-            app_password: encrypt(appPassword),
-            created_at: new Date(),
-          })
-          .execute();
-
-      } else {
-        return res.status(400).json({ error: 'Invalid type. Must be "new" or "existing"' });
+      if (!existingDid || !appPassword) {
+        return res.status(400).json({ error: 'did and appPassword are required' });
       }
+
+      const communityDid = existingDid;
+      let communityHandle: string;
+
+      // Resolve DID to get handle and PDS
+      const pdsHost = 'https://bsky.social';
+      try {
+        const profile = await agent.getProfile({ actor: existingDid });
+        communityHandle = profile.data.handle || existingDid;
+      } catch (e) {
+        console.warn('Could not resolve handle, using DID as fallback');
+        communityHandle = existingDid;
+      }
+
+      // Login with app password to verify credentials
+      const bskyAgent = new BskyAgent({ service: pdsHost });
+      await bskyAgent.login({
+        identifier: existingDid,
+        password: appPassword,
+      });
+      const communityAgent: Agent = bskyAgent;
+
+      // Store in database
+      await db
+        .insertInto('communities')
+        .values({
+          did: communityDid,
+          handle: communityHandle,
+          display_name: displayName,
+          pds_host: pdsHost,
+          app_password: encrypt(appPassword),
+          created_at: new Date(),
+        })
+        .execute();
 
       // Create community profile
       try {
@@ -521,6 +475,15 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       }
 
       // Create membership record in user's repo
+      // Verify the OAuth session has the required scope to write membership records
+      const grantedScope = getAgentScope(agent);
+      if (grantedScope && !hasScope(grantedScope, MEMBERSHIP_WRITE_SCOPE)) {
+        return res.status(403).json({
+          error: 'Insufficient scope',
+          details: `Required scope: ${MEMBERSHIP_WRITE_SCOPE}`,
+        });
+      }
+
       const membershipRecord = await agent.api.com.atproto.repo.createRecord({
         repo: agent.assertDid,
         collection: 'community.opensocial.membership',
@@ -729,6 +692,113 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       console.error('Failed to upload avatar:', err);
       return res.status(500).json({ 
         error: 'Failed to upload avatar',
+        details: err instanceof Error ? err.message : 'Unknown error'
+      });
+    }
+  });
+
+  // Upload community banner (or reuse Bluesky banner)
+  router.post('/communities/:did/banner', upload.single('banner'), async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const communityDid = decodeURIComponent(req.params.did);
+
+      const community = await db
+        .selectFrom('communities')
+        .selectAll()
+        .where('did', '=', communityDid)
+        .executeTakeFirst();
+
+      if (!community) {
+        return res.status(404).json({ error: 'Community not found' });
+      }
+
+      const communityAgent = new BskyAgent({ service: community.pds_host });
+      await communityAgent.login({
+        identifier: community.handle,
+        password: decryptIfNeeded(community.app_password),
+      });
+
+      // Check if user is admin
+      const adminsResponse = await communityAgent.api.com.atproto.repo.getRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.admins',
+        rkey: 'self',
+      });
+
+      const adminsValue = adminsResponse.data.value as { admins: string[] };
+      if (!isAdminInList(agent.assertDid, adminsValue.admins || adminsValue)) {
+        return res.status(403).json({ error: 'Not authorized. Must be an admin.' });
+      }
+
+      let blobRef: any;
+
+      if (req.body.reuseBluesky === 'true' || req.body.reuseBluesky === true) {
+        // Reuse the creator's Bluesky banner
+        const creatorDid = agent.assertDid;
+        try {
+          const bskyProfile = await agent.getProfile({ actor: creatorDid });
+          if (!bskyProfile.data.banner) {
+            return res.status(404).json({ error: 'No Bluesky banner found on your profile' });
+          }
+          // Fetch the banner blob and re-upload to community PDS
+          const bannerUrl = bskyProfile.data.banner;
+          const bannerRes = await fetch(bannerUrl);
+          if (!bannerRes.ok) {
+            return res.status(500).json({ error: 'Failed to fetch Bluesky banner' });
+          }
+          const bannerData = new Uint8Array(await bannerRes.arrayBuffer());
+          const contentType = bannerRes.headers.get('content-type') || 'image/jpeg';
+          const uploadResponse = await communityAgent.api.com.atproto.repo.uploadBlob(bannerData, {
+            encoding: contentType,
+          });
+          blobRef = uploadResponse.data.blob;
+        } catch (e) {
+          console.error('Failed to reuse Bluesky banner:', e);
+          return res.status(500).json({ error: 'Failed to reuse Bluesky banner' });
+        }
+      } else {
+        // Use uploaded file
+        const file = req.file;
+        if (!file) {
+          return res.status(400).json({ error: 'No file uploaded. Send a banner file or set reuseBluesky=true' });
+        }
+
+        const uploadResponse = await communityAgent.api.com.atproto.repo.uploadBlob(file.buffer, {
+          encoding: file.mimetype,
+        });
+        blobRef = uploadResponse.data.blob;
+      }
+
+      // Update community profile with new banner
+      const profileResponse = await communityAgent.api.com.atproto.repo.getRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.profile',
+        rkey: 'self',
+      });
+
+      const currentProfile = profileResponse.data.value as CommunityProfile;
+
+      await communityAgent.api.com.atproto.repo.putRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.profile',
+        rkey: 'self',
+        record: {
+          ...currentProfile,
+          $type: 'community.opensocial.profile',
+          banner: blobRef,
+        },
+      });
+
+      return res.json({ success: true, banner: blobRef });
+    } catch (err) {
+      console.error('Failed to upload banner:', err);
+      return res.status(500).json({ 
+        error: 'Failed to upload banner',
         details: err instanceof Error ? err.message : 'Unknown error'
       });
     }

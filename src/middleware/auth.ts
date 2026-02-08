@@ -51,3 +51,62 @@ export function createVerifyApiKey(db: Kysely<Database>) {
     }
   };
 }
+
+/**
+ * Parse a scope string into its individual scope values.
+ * Scopes are space-separated per the OAuth 2.0 spec.
+ */
+export function parseScopeString(scope: string): string[] {
+  return scope.split(/\s+/).filter(Boolean);
+}
+
+/**
+ * Check whether a granted scope string satisfies a required scope.
+ *
+ * A required scope like `repo:community.opensocial.membership` is satisfied if:
+ * - The exact scope is present, OR
+ * - A wildcard scope covering it is present (e.g. `repo:*`), OR
+ * - The legacy `transition:generic` scope is present (full access fallback)
+ *
+ * For `repo:` scopes, the collection part is compared. A granted
+ * `repo:community.opensocial.*` would NOT match because the AT Proto spec
+ * does not allow partial wildcards — only `repo:*` (all collections).
+ */
+export function hasScope(grantedScopeString: string, requiredScope: string): boolean {
+  const granted = parseScopeString(grantedScopeString);
+
+  // transition:generic is the legacy full-access scope — it satisfies everything
+  if (granted.includes('transition:generic')) {
+    return true;
+  }
+
+  // Check for exact match
+  if (granted.includes(requiredScope)) {
+    return true;
+  }
+
+  // Check for wildcard coverage within the same resource type
+  // e.g. required = "repo:community.opensocial.membership", granted includes "repo:*"
+  const [requiredResource] = requiredScope.split(':');
+  for (const scope of granted) {
+    const [resource, value] = scope.split(':');
+    if (resource === requiredResource && value === '*') {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * The set of OAuth scopes that Open Social requests.
+ * - `atproto` — required base scope for all AT Proto OAuth flows
+ * - `repo:community.opensocial.membership` — write membership records to user's repo
+ * - `transition:generic` — legacy full-access fallback for PDS compatibility
+ */
+export const OPENSOCIAL_SCOPES = 'atproto repo:community.opensocial.membership transition:generic';
+
+/**
+ * The granular scope required to write membership records.
+ */
+export const MEMBERSHIP_WRITE_SCOPE = 'repo:community.opensocial.membership';

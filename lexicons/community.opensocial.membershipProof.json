@@ -15,6 +15,11 @@
             "format": "did",
             "description": "DID of the member whose membership is being confirmed"
           },
+          "membershipRef": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI reference to the user's community.opensocial.membership record"
+          },
           "cid": {
             "type": "string",
             "description": "CID of the member's community.opensocial.membership record"

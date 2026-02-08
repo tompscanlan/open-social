@@ -1,345 +1,422 @@
 import { Router } from 'express';
-import crypto from 'crypto';
-import { BskyAgent } from '@atproto/api';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
-import { createVerifyApiKey, AuthenticatedRequest } from '../middleware/auth';
-import { getPublicAgent } from '../services/atproto';
+import { createVerifyApiKey, type AuthenticatedRequest } from '../middleware/auth';
+import {
+  createCommunityApiKeySchema,
+  searchCommunitiesSchema,
+  deleteCommunitySchema,
+  updateCommunityProfileSchema,
+} from '../validation/schemas';
+import { parsePagination, encodeCursor, decodeCursor } from '../lib/pagination';
 import { isAdminInList, normalizeAdmins } from '../lib/adminUtils';
 import { encrypt } from '../lib/crypto';
+import { createAuditLogService } from '../services/auditLog';
+import { createWebhookService } from '../services/webhook';
+import { createCommunityAgent } from '../services/atproto';
+import { config } from '../config';
 
-export function createCommunityRouter(db: Kysely<Database>) {
+export function createCommunityRouter(db: Kysely<Database>): Router {
   const router = Router();
   const verifyApiKey = createVerifyApiKey(db);
+  const auditLog = createAuditLogService(db);
+  const webhooks = createWebhookService(db);
 
-  // Create a new community
+  // Create a community (requires an existing AT Protocol account)
   router.post('/', verifyApiKey, async (req: AuthenticatedRequest, res) => {
-    const { handle, display_name, description, creator_did } = req.body;
-
-    if (!handle || !display_name || !creator_did) {
-      return res.status(400).json({
-        error: 'Missing required fields: handle, display_name, creator_did',
-      });
-    }
-
-    if (!handle.endsWith('.opensocial.community')) {
-      return res.status(400).json({
-        error: 'Handle must end with .opensocial.community',
-      });
-    }
-
-    const pdsHost = process.env.PDS_HOSTNAME || 'opensocial.community';
-    const accountPassword = crypto.randomBytes(32).toString('hex');
-
     try {
-      // Create account on PDS via API
-      console.log(`Creating PDS account for ${handle}...`);
-
-      const createResponse = await fetch(`https://${pdsHost}/xrpc/com.atproto.server.createAccount`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: `${handle.split('.')[0]}@opensocial.community`,
-          handle: handle,
-          password: accountPassword,
-        }),
-      });
-
-      if (!createResponse.ok) {
-        const error = await createResponse.json();
-        console.error('PDS account creation failed:', error);
-        return res.status(500).json({
-          error: 'Failed to create PDS account',
-          details: (error as any).message || 'Unknown error',
-        });
+      const parsed = createCommunityApiKeySchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
 
-      const accountData = await createResponse.json() as { did: string; handle: string };
-      const did = accountData.did;
+      const { did, appPassword, displayName, creatorDid, description } = parsed.data;
 
-      console.log(`Created community account with DID: ${did}`);
-
-      // Wait a moment for account to be fully ready
-      await new Promise(resolve => setTimeout(resolve, 1000));
-
-      // Login to get agent
-      const agent = new BskyAgent({ service: `https://${pdsHost}` });
-      await agent.login({
-        identifier: handle,
-        password: accountPassword,
-      });
-
-      // Fetch creator's Bluesky profile to get avatar
-      let avatarBlob = undefined;
+      // Resolve the DID to get its handle
+      let handle: string;
+      const pdsHost = config.pdsUrl || 'https://bsky.social';
       try {
-        const publicAgent = new BskyAgent({ service: 'https://public.api.bsky.app' });
-        const creatorProfile = await publicAgent.getProfile({ actor: creator_did });
-
-        if (creatorProfile.data.avatar) {
-          const avatarResponse = await fetch(creatorProfile.data.avatar);
-          if (avatarResponse.ok) {
-            const avatarBuffer = await avatarResponse.arrayBuffer();
-            const avatarUint8 = new Uint8Array(avatarBuffer);
-
-            const uploadResponse = await agent.uploadBlob(avatarUint8, {
-              encoding: avatarResponse.headers.get('content-type') || 'image/jpeg',
-            });
-            avatarBlob = uploadResponse.data.blob;
-            console.log('Avatar uploaded successfully');
-          }
+        const profileRes = await fetch(
+          `https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=${encodeURIComponent(did)}`
+        );
+        if (profileRes.ok) {
+          const profile = await profileRes.json() as any;
+          handle = profile.handle || did;
+        } else {
+          handle = did;
         }
-      } catch (error) {
-        console.warn('Could not fetch/upload avatar from creator profile:', error);
-        // Continue without avatar
+      } catch {
+        handle = did;
       }
 
-      // Create profile record
-      const profileRecord: any = {
-        $type: 'community.opensocial.profile',
-        displayName: display_name,
-        description: description || '',
-        createdAt: new Date().toISOString(),
-      };
-
-      if (avatarBlob) {
-        profileRecord.avatar = avatarBlob;
+      // Verify credentials by logging in with the app password
+      const { BskyAgent } = await import('@atproto/api');
+      const bskyAgent = new BskyAgent({ service: pdsHost });
+      try {
+        await bskyAgent.login({ identifier: did, password: appPassword });
+      } catch (e) {
+        return res.status(400).json({ error: 'Invalid DID or app password. Could not authenticate with the provided credentials.' });
       }
-
-      await agent.com.atproto.repo.putRecord({
-        repo: did,
-        collection: 'community.opensocial.profile',
-        rkey: 'self',
-        record: profileRecord,
-      });
-
-      // Create admins record
-      await agent.com.atproto.repo.putRecord({
-        repo: did,
-        collection: 'community.opensocial.admins',
-        rkey: 'self',
-        record: {
-          $type: 'community.opensocial.admins',
-          admins: [
-            {
-              did: creator_did,
-              permissions: ['edit_profile', 'manage_admins', 'moderate', 'post'],
-              addedAt: new Date().toISOString(),
-            },
-          ],
-        },
-      });
 
       // Store in database
-      const community = await db
+      const encryptedPassword = encrypt(appPassword);
+      await db
         .insertInto('communities')
         .values({
           did,
           handle,
-          display_name: display_name,
+          display_name: displayName,
           pds_host: pdsHost,
-          app_password: encrypt(accountPassword),
+          app_password: encryptedPassword,
         })
-        .returningAll()
-        .executeTakeFirstOrThrow();
+        .execute();
 
-      res.json({
+      // Create profile and admins records
+      try {
+        const agent = await createCommunityAgent(db, did);
+
+        // Try to copy creator's Bluesky avatar
+        let avatarBlob;
+        try {
+          const creatorProfileRes = await fetch(
+            `https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=${encodeURIComponent(creatorDid)}`
+          );
+          if (creatorProfileRes.ok) {
+            const creatorProfile = await creatorProfileRes.json() as any;
+            if (creatorProfile.avatar) {
+              const blobRes = await fetch(creatorProfile.avatar);
+              if (blobRes.ok) {
+                const blobData = new Uint8Array(await blobRes.arrayBuffer());
+                const contentType = blobRes.headers.get('content-type') || 'image/jpeg';
+                const uploadRes = await agent.api.com.atproto.repo.uploadBlob(blobData, {
+                  encoding: contentType,
+                });
+                avatarBlob = uploadRes.data.blob;
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('Could not copy creator avatar:', e);
+        }
+
+        // Create profile record
+        await agent.api.com.atproto.repo.putRecord({
+          repo: did,
+          collection: 'community.opensocial.profile',
+          rkey: 'self',
+          record: {
+            $type: 'community.opensocial.profile',
+            displayName,
+            description: description || '',
+            createdAt: new Date().toISOString(),
+            type: 'open',
+            ...(avatarBlob ? { avatar: avatarBlob } : {}),
+          },
+        });
+
+        // Create admins record
+        await agent.api.com.atproto.repo.putRecord({
+          repo: did,
+          collection: 'community.opensocial.admins',
+          rkey: 'self',
+          record: {
+            $type: 'community.opensocial.admins',
+            admins: [{ did: creatorDid, addedAt: new Date().toISOString() }],
+          },
+        });
+
+        // Create membership proof for creator
+        await agent.api.com.atproto.repo.createRecord({
+          repo: did,
+          collection: 'community.opensocial.membershipProof',
+          record: {
+            $type: 'community.opensocial.membershipProof',
+            memberDid: creatorDid,
+            cid: '',
+            confirmedAt: new Date().toISOString(),
+          },
+        });
+      } catch (e) {
+        console.error('Failed to create community records:', e);
+      }
+
+      await auditLog.log({
+        communityDid: did,
+        adminDid: creatorDid,
+        action: 'community.created',
+        metadata: { handle, displayName },
+      });
+
+      res.status(201).json({
         community: {
           did,
           handle,
-          display_name,
-          pds_host: pdsHost,
-          created_at: community.created_at,
+          displayName,
+          pdsHost,
+          createdAt: new Date().toISOString(),
         },
-        is_admin: true,
+        isAdmin: true,
       });
-    } catch (error: any) {
-      console.error('Error creating community:', error);
-      res.status(500).json({
-        error: 'Failed to create community',
-        details: error.message,
-      });
+    } catch (error) {
+      console.error('Create community error:', error);
+      res.status(500).json({ error: 'Failed to create community' });
     }
   });
 
-  // List communities
+  // List / search communities
   router.get('/', verifyApiKey, async (req: AuthenticatedRequest, res) => {
-    const { user_did } = req.query;
-
     try {
-      const communities = await db
+      const parsed = searchCommunitiesSchema.safeParse(req.query);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid query', details: parsed.error.flatten() });
+      }
+
+      const { query, userDid, cursor, limit } = parsed.data;
+      const offset = cursor ? decodeCursor(cursor) : 0;
+
+      let dbQuery = db
         .selectFrom('communities')
-        .select(['did', 'handle', 'display_name', 'pds_host', 'created_at'])
+        .selectAll();
+
+      // Search by name or handle
+      if (query) {
+        dbQuery = dbQuery.where((eb) =>
+          eb.or([
+            eb('handle', 'ilike', `%${query}%`),
+            eb('display_name', 'ilike', `%${query}%`),
+          ])
+        );
+      }
+
+      const allCommunities = await dbQuery
         .orderBy('created_at', 'desc')
+        .offset(offset)
+        .limit(limit + 1)
         .execute();
 
-      const result = await Promise.all(
-        communities.map(async (community) => {
-          let is_admin = false;
-          let communityType = 'open';
+      const hasMore = allCommunities.length > limit;
+      const page = hasMore ? allCommunities.slice(0, limit) : allCommunities;
+
+      // Enrich with profile data, admin status, and member count
+      const enriched = await Promise.all(
+        page.map(async (community) => {
+          let isAdmin = false;
+          let type = 'open';
+          let memberCount = 0;
 
           try {
-            const agent = await getPublicAgent(community.pds_host);
+            const agent = await createCommunityAgent(db, community.did);
 
-            // Fetch profile to get community type
+            // Get profile
             try {
-              const profileRecord = await agent.com.atproto.repo.getRecord({
+              const profileRes = await agent.api.com.atproto.repo.getRecord({
                 repo: community.did,
                 collection: 'community.opensocial.profile',
                 rkey: 'self',
               });
-              const profile = profileRecord.data.value as any;
-              communityType = profile.type || 'open';
-            } catch (error) {
-              // Profile fetch failed — default to open
-            }
+              type = (profileRes.data.value as any)?.type || 'open';
+            } catch {}
 
-            if (user_did) {
+            // Check admin status
+            if (userDid) {
               try {
-                const adminRecord = await agent.com.atproto.repo.getRecord({
+                const adminsRes = await agent.api.com.atproto.repo.getRecord({
                   repo: community.did,
                   collection: 'community.opensocial.admins',
                   rkey: 'self',
                 });
-
-                const admins = (adminRecord.data.value as any).admins || [];
-                is_admin = isAdminInList(user_did as string, admins);
-              } catch (error) {
-                console.error(`Error checking admin status for ${community.handle}`);
-              }
+                const admins = (adminsRes.data.value as any)?.admins || [];
+                isAdmin = isAdminInList(userDid, admins);
+              } catch {}
             }
-          } catch (error) {
-            console.error(`Error fetching data for ${community.handle}`);
-          }
 
-          return { ...community, is_admin, type: communityType };
+            // Get member count
+            try {
+              const membersRes = await agent.api.com.atproto.repo.listRecords({
+                repo: community.did,
+                collection: 'community.opensocial.membershipProof',
+                limit: 1,
+              });
+              // Use cursor-based counting: fetch all to count
+              let count = membersRes.data.records.length;
+              let memberCursor = membersRes.data.cursor;
+              while (memberCursor) {
+                const more = await agent.api.com.atproto.repo.listRecords({
+                  repo: community.did,
+                  collection: 'community.opensocial.membershipProof',
+                  cursor: memberCursor,
+                  limit: 100,
+                });
+                count += more.data.records.length;
+                memberCursor = more.data.cursor;
+              }
+              memberCount = count;
+            } catch {}
+          } catch {}
+
+          return {
+            did: community.did,
+            handle: community.handle,
+            displayName: community.display_name,
+            pdsHost: community.pds_host,
+            createdAt: community.created_at,
+            type,
+            isAdmin,
+            memberCount,
+          };
         })
       );
 
-      res.json({ communities: result });
+      res.json({
+        communities: enriched,
+        cursor: hasMore ? encodeCursor(offset + limit) : undefined,
+      });
     } catch (error) {
-      console.error('Error fetching communities:', error);
-      res.status(500).json({ error: 'Failed to fetch communities' });
+      console.error('List communities error:', error);
+      res.status(500).json({ error: 'Failed to list communities' });
     }
   });
 
-  // Get single community with full profile
+  // Get community details
   router.get('/:did', verifyApiKey, async (req: AuthenticatedRequest, res) => {
-    const { did } = req.params;
-    const { user_did } = req.query;
-
     try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const userDid = req.query.userDid as string | undefined;
+
       const community = await db
         .selectFrom('communities')
         .selectAll()
-        .where('did', '=', did)
+        .where('did', '=', communityDid)
         .executeTakeFirst();
 
       if (!community) {
         return res.status(404).json({ error: 'Community not found' });
       }
 
-      const agent = await getPublicAgent(community.pds_host);
+      let profile: any = {};
+      let admins: any[] = [];
+      let isAdmin = false;
+      let memberCount = 0;
 
-      // Fetch profile
-      const profileRecord = await agent.com.atproto.repo.getRecord({
-        repo: community.did,
-        collection: 'community.opensocial.profile',
-        rkey: 'self',
-      });
+      try {
+        const agent = await createCommunityAgent(db, communityDid);
 
-      // Fetch admins
-      const adminRecord = await agent.com.atproto.repo.getRecord({
-        repo: community.did,
-        collection: 'community.opensocial.admins',
-        rkey: 'self',
-      });
+        try {
+          const profileRes = await agent.api.com.atproto.repo.getRecord({
+            repo: communityDid,
+            collection: 'community.opensocial.profile',
+            rkey: 'self',
+          });
+          profile = profileRes.data.value as any;
+        } catch {}
 
-      const profile = profileRecord.data.value as any;
-      const admins = (adminRecord.data.value as any).admins || [];
-      const is_admin = user_did
-        ? admins.some((admin: any) => admin.did === user_did)
-        : false;
+        try {
+          const adminsRes = await agent.api.com.atproto.repo.getRecord({
+            repo: communityDid,
+            collection: 'community.opensocial.admins',
+            rkey: 'self',
+          });
+          admins = (adminsRes.data.value as any)?.admins || [];
+          if (userDid) {
+            isAdmin = isAdminInList(userDid, admins);
+          }
+        } catch {}
+
+        // Count members
+        try {
+          let count = 0;
+          let memberCursor: string | undefined;
+          do {
+            const membersRes = await agent.api.com.atproto.repo.listRecords({
+              repo: communityDid,
+              collection: 'community.opensocial.membershipProof',
+              limit: 100,
+              cursor: memberCursor,
+            });
+            count += membersRes.data.records.length;
+            memberCursor = membersRes.data.cursor;
+          } while (memberCursor);
+          memberCount = count;
+        } catch {}
+      } catch {}
 
       res.json({
         community: {
           did: community.did,
           handle: community.handle,
-          pds_host: community.pds_host,
-          display_name: profile.displayName,
-          description: profile.description,
-          guidelines: profile.guidelines,
+          pdsHost: community.pds_host,
+          displayName: profile.displayName || community.display_name,
+          description: profile.description || '',
+          guidelines: profile.guidelines || '',
           type: profile.type || 'open',
-          admins,
-          created_at: profile.createdAt,
+          avatar: profile.avatar || null,
+          banner: profile.banner || null,
+          admins: normalizeAdmins(admins).map((a) => a.did),
+          createdAt: community.created_at,
+          memberCount,
         },
-        is_admin,
+        isAdmin,
       });
     } catch (error) {
-      console.error('Error fetching community:', error);
-      res.status(500).json({ error: 'Failed to fetch community' });
+      console.error('Get community error:', error);
+      res.status(500).json({ error: 'Failed to get community' });
     }
   });
 
-  // Delete a community
+  // Delete community
   router.delete('/:did', verifyApiKey, async (req: AuthenticatedRequest, res) => {
-    const { did } = req.params;
-    const { user_did } = req.body;
-
-    if (!user_did) {
-      return res.status(400).json({
-        error: 'Missing required field: user_did',
-      });
-    }
-
     try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const parsed = deleteCommunitySchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
+      }
+
+      const { adminDid } = parsed.data;
+
       const community = await db
         .selectFrom('communities')
         .selectAll()
-        .where('did', '=', did)
+        .where('did', '=', communityDid)
         .executeTakeFirst();
 
       if (!community) {
         return res.status(404).json({ error: 'Community not found' });
       }
 
-      const agent = await getPublicAgent(community.pds_host);
-
-      // Fetch admins to verify permissions
-      const adminRecord = await agent.com.atproto.repo.getRecord({
-        repo: community.did,
-        collection: 'community.opensocial.admins',
-        rkey: 'self',
-      });
-
-      const admins = (adminRecord.data.value as any).admins || [];
-
-      // Check if user is an admin
-      const isAdmin = isAdminInList(user_did, admins);
-      if (!isAdmin) {
-        return res.status(403).json({
-          error: 'Only admins can delete a community',
+      // Verify admin status
+      try {
+        const agent = await createCommunityAgent(db, communityDid);
+        const adminsRes = await agent.api.com.atproto.repo.getRecord({
+          repo: communityDid,
+          collection: 'community.opensocial.admins',
+          rkey: 'self',
         });
+        const admins = (adminsRes.data.value as any)?.admins || [];
+
+        if (!isAdminInList(adminDid, admins)) {
+          return res.status(403).json({ error: 'Not an admin of this community' });
+        }
+
+        if (normalizeAdmins(admins).length > 1) {
+          return res.status(400).json({ error: 'Community must have only one admin to be deleted. Remove other admins first.' });
+        }
+      } catch {
+        return res.status(500).json({ error: 'Failed to verify admin status' });
       }
 
-      // Check if there's only one admin
-      if (admins.length > 1) {
-        return res.status(403).json({
-          error: 'Community can only be deleted when there is a single admin',
-        });
-      }
+      await db.deleteFrom('communities').where('did', '=', communityDid).execute();
+      await db.deleteFrom('pending_members').where('community_did', '=', communityDid).execute();
 
-      // Delete from database
-      await db
-        .deleteFrom('communities')
-        .where('did', '=', did)
-        .execute();
-
-      res.json({
-        success: true,
-        message: 'Community deleted successfully',
+      await auditLog.log({
+        communityDid,
+        adminDid,
+        action: 'community.deleted',
       });
+
+      res.json({ success: true });
     } catch (error) {
-      console.error('Error deleting community:', error);
+      console.error('Delete community error:', error);
       res.status(500).json({ error: 'Failed to delete community' });
     }
   });

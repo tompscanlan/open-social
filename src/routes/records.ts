@@ -1,30 +1,33 @@
 import { Router } from 'express';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
-import { createVerifyApiKey, AuthenticatedRequest } from '../middleware/auth';
-import { createCommunityAgent } from '../services/atproto';
+import { createVerifyApiKey, type AuthenticatedRequest } from '../middleware/auth';
+import {
+  createRecordSchema,
+  updateRecordSchema,
+  deleteRecordSchema,
+  listRecordsSchema,
+  membershipCheckSchema,
+} from '../validation/schemas';
 import { isAdminInList } from '../lib/adminUtils';
+import { createCommunityAgent } from '../services/atproto';
+import { createWebhookService } from '../services/webhook';
 
 /**
  * Collections that only admins can write to.
- * All other community.opensocial.* collections are writable by any member.
  */
 const ADMIN_ONLY_COLLECTIONS = new Set([
   'community.opensocial.listitem.status',
-  'app.collectivesocial.group.listitem.status',
   'community.opensocial.profile',
   'community.opensocial.admins',
 ]);
 
 /**
  * Collections that only admins can update (PUT).
- * Lists can be created by anyone but only updated by admins.
  */
 const ADMIN_UPDATE_COLLECTIONS = new Set([
   'community.opensocial.list',
-  'app.collectivesocial.group.list',
   'community.opensocial.listitem.status',
-  'app.collectivesocial.group.listitem.status',
   'community.opensocial.profile',
   'community.opensocial.admins',
 ]);
@@ -67,42 +70,42 @@ async function isAdmin(communityAgent: any, communityDid: string, userDid: strin
   }
 }
 
-export function createRecordsRouter(db: Kysely<Database>) {
+export function createRecordsRouter(db: Kysely<Database>): Router {
   const router = Router();
   const verifyApiKey = createVerifyApiKey(db);
+  const webhooks = createWebhookService(db);
 
   /**
    * POST /communities/:did/records
    * Create a record in the community's PDS repo on behalf of a member.
    *
-   * Body: { user_did, collection, record, rkey? }
-   *
-   * Auth: API key + user must be a member. Admin-only collections require admin status.
+   * Body: { userDid, collection, record, rkey? }
    */
   router.post('/:did/records', verifyApiKey, async (req: AuthenticatedRequest, res) => {
-    const { did } = req.params;
-    const { user_did, collection, record, rkey } = req.body;
-
-    if (!user_did || !collection || !record) {
-      return res.status(400).json({ error: 'user_did, collection, and record are required' });
-    }
-
     try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const parsed = createRecordSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
+      }
+
+      const { userDid, collection, record, rkey } = parsed.data;
+
       const community = await db
         .selectFrom('communities')
         .selectAll()
-        .where('did', '=', did)
+        .where('did', '=', communityDid)
         .executeTakeFirst();
 
       if (!community) {
         return res.status(404).json({ error: 'Community not found' });
       }
 
-      const communityAgent = await createCommunityAgent(db, did);
+      const communityAgent = await createCommunityAgent(db, communityDid);
 
       // Verify membership (admins are implicitly members)
-      const memberCheck = await isMember(communityAgent, did, user_did);
-      const adminCheck = await isAdmin(communityAgent, did, user_did);
+      const memberCheck = await isMember(communityAgent, communityDid, userDid);
+      const adminCheck = await isAdmin(communityAgent, communityDid, userDid);
       if (!memberCheck && !adminCheck) {
         return res.status(403).json({ error: 'User is not a member of this community' });
       }
@@ -112,9 +115,8 @@ export function createRecordsRouter(db: Kysely<Database>) {
         return res.status(403).json({ error: 'Only admins can write to this collection' });
       }
 
-      // Create the record in the community's repo
       const response = await communityAgent.api.com.atproto.repo.createRecord({
-        repo: did,
+        repo: communityDid,
         collection,
         rkey,
         record: {
@@ -123,7 +125,14 @@ export function createRecordsRouter(db: Kysely<Database>) {
         },
       });
 
-      res.json({
+      await webhooks.dispatch('record.created', communityDid, {
+        communityDid,
+        collection,
+        uri: response.data.uri,
+        userDid,
+      });
+
+      res.status(201).json({
         uri: response.data.uri,
         cid: response.data.cid,
       });
@@ -137,34 +146,33 @@ export function createRecordsRouter(db: Kysely<Database>) {
    * PUT /communities/:did/records
    * Update a record in the community's PDS repo.
    *
-   * Body: { user_did, collection, rkey, record }
-   *
-   * Auth: API key + user must be a member. Admin-update collections require admin status.
+   * Body: { userDid, collection, rkey, record }
    */
   router.put('/:did/records', verifyApiKey, async (req: AuthenticatedRequest, res) => {
-    const { did } = req.params;
-    const { user_did, collection, rkey, record } = req.body;
-
-    if (!user_did || !collection || !rkey || !record) {
-      return res.status(400).json({ error: 'user_did, collection, rkey, and record are required' });
-    }
-
     try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const parsed = updateRecordSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
+      }
+
+      const { userDid, collection, rkey, record } = parsed.data;
+
       const community = await db
         .selectFrom('communities')
         .selectAll()
-        .where('did', '=', did)
+        .where('did', '=', communityDid)
         .executeTakeFirst();
 
       if (!community) {
         return res.status(404).json({ error: 'Community not found' });
       }
 
-      const communityAgent = await createCommunityAgent(db, did);
+      const communityAgent = await createCommunityAgent(db, communityDid);
 
-      // Verify membership (admins are implicitly members)
-      const memberCheck = await isMember(communityAgent, did, user_did);
-      const adminCheck = await isAdmin(communityAgent, did, user_did);
+      // Verify membership
+      const memberCheck = await isMember(communityAgent, communityDid, userDid);
+      const adminCheck = await isAdmin(communityAgent, communityDid, userDid);
       if (!memberCheck && !adminCheck) {
         return res.status(403).json({ error: 'User is not a member of this community' });
       }
@@ -175,13 +183,21 @@ export function createRecordsRouter(db: Kysely<Database>) {
       }
 
       const response = await communityAgent.api.com.atproto.repo.putRecord({
-        repo: did,
+        repo: communityDid,
         collection,
         rkey,
         record: {
           $type: collection,
           ...record,
         },
+      });
+
+      await webhooks.dispatch('record.updated', communityDid, {
+        communityDid,
+        collection,
+        rkey,
+        uri: response.data.uri,
+        userDid,
       });
 
       res.json({
@@ -198,34 +214,34 @@ export function createRecordsRouter(db: Kysely<Database>) {
    * DELETE /communities/:did/records/:collection/:rkey
    * Delete a record from the community's PDS repo.
    *
-   * Query: ?user_did=…
-   *
-   * Auth: API key + user must be a member. Admin-only/admin-update collections require admin status.
+   * Query: ?userDid=...
    */
   router.delete('/:did/records/:collection/:rkey', verifyApiKey, async (req: AuthenticatedRequest, res) => {
-    const { did, collection, rkey } = req.params;
-    const user_did = req.query.user_did as string;
-
-    if (!user_did) {
-      return res.status(400).json({ error: 'user_did query parameter is required' });
-    }
-
     try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const { collection, rkey } = req.params;
+      const parsed = deleteRecordSchema.safeParse(req.query);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid query', details: parsed.error.flatten() });
+      }
+
+      const { userDid } = parsed.data;
+
       const community = await db
         .selectFrom('communities')
         .selectAll()
-        .where('did', '=', did)
+        .where('did', '=', communityDid)
         .executeTakeFirst();
 
       if (!community) {
         return res.status(404).json({ error: 'Community not found' });
       }
 
-      const communityAgent = await createCommunityAgent(db, did);
+      const communityAgent = await createCommunityAgent(db, communityDid);
 
-      // Verify membership (admins are implicitly members)
-      const memberCheck = await isMember(communityAgent, did, user_did);
-      const adminCheck = await isAdmin(communityAgent, did, user_did);
+      // Verify membership
+      const memberCheck = await isMember(communityAgent, communityDid, userDid);
+      const adminCheck = await isAdmin(communityAgent, communityDid, userDid);
       if (!memberCheck && !adminCheck) {
         return res.status(403).json({ error: 'User is not a member of this community' });
       }
@@ -236,9 +252,16 @@ export function createRecordsRouter(db: Kysely<Database>) {
       }
 
       await communityAgent.api.com.atproto.repo.deleteRecord({
-        repo: did,
+        repo: communityDid,
         collection,
         rkey,
+      });
+
+      await webhooks.dispatch('record.deleted', communityDid, {
+        communityDid,
+        collection,
+        rkey,
+        userDid,
       });
 
       res.json({ success: true });
@@ -250,30 +273,33 @@ export function createRecordsRouter(db: Kysely<Database>) {
 
   /**
    * GET /communities/:did/records/:collection
-   * List records in a specific collection from the community's PDS repo.
-   *
-   * Query: ?limit=&cursor=
+   * List records in a specific collection.
    */
   router.get('/:did/records/:collection', verifyApiKey, async (req: AuthenticatedRequest, res) => {
-    const { did, collection } = req.params;
-    const limit = Math.min(Number(req.query.limit) || 50, 100);
-    const cursor = req.query.cursor as string | undefined;
-
     try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const { collection } = req.params;
+      const parsed = listRecordsSchema.safeParse(req.query);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid query', details: parsed.error.flatten() });
+      }
+
+      const { limit, cursor } = parsed.data;
+
       const community = await db
         .selectFrom('communities')
         .selectAll()
-        .where('did', '=', did)
+        .where('did', '=', communityDid)
         .executeTakeFirst();
 
       if (!community) {
         return res.status(404).json({ error: 'Community not found' });
       }
 
-      const communityAgent = await createCommunityAgent(db, did);
+      const communityAgent = await createCommunityAgent(db, communityDid);
 
       const response = await communityAgent.api.com.atproto.repo.listRecords({
-        repo: did,
+        repo: communityDid,
         collection,
         limit,
         cursor,
@@ -281,7 +307,7 @@ export function createRecordsRouter(db: Kysely<Database>) {
 
       res.json({
         records: response.data.records,
-        cursor: response.data.cursor,
+        cursor: response.data.cursor || undefined,
       });
     } catch (error: any) {
       console.error('Error listing community records:', error);
@@ -291,26 +317,27 @@ export function createRecordsRouter(db: Kysely<Database>) {
 
   /**
    * GET /communities/:did/records/:collection/:rkey
-   * Get a specific record from the community's PDS repo.
+   * Get a specific record.
    */
   router.get('/:did/records/:collection/:rkey', verifyApiKey, async (req: AuthenticatedRequest, res) => {
-    const { did, collection, rkey } = req.params;
-
     try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const { collection, rkey } = req.params;
+
       const community = await db
         .selectFrom('communities')
         .selectAll()
-        .where('did', '=', did)
+        .where('did', '=', communityDid)
         .executeTakeFirst();
 
       if (!community) {
         return res.status(404).json({ error: 'Community not found' });
       }
 
-      const communityAgent = await createCommunityAgent(db, did);
+      const communityAgent = await createCommunityAgent(db, communityDid);
 
       const response = await communityAgent.api.com.atproto.repo.getRecord({
-        repo: did,
+        repo: communityDid,
         collection,
         rkey,
       });
@@ -323,50 +350,6 @@ export function createRecordsRouter(db: Kysely<Database>) {
     } catch (error: any) {
       console.error('Error getting community record:', error);
       res.status(500).json({ error: error.message || 'Failed to get record' });
-    }
-  });
-
-  /**
-   * POST /communities/:did/membership/check
-   * Check if a user is a member (and/or admin) of a community.
-   *
-   * Body: { user_did }
-   * Returns: { is_member, is_admin }
-   */
-  router.post('/:did/membership/check', verifyApiKey, async (req: AuthenticatedRequest, res) => {
-    const { did } = req.params;
-    const { user_did } = req.body;
-
-    if (!user_did) {
-      return res.status(400).json({ error: 'user_did is required' });
-    }
-
-    try {
-      const community = await db
-        .selectFrom('communities')
-        .selectAll()
-        .where('did', '=', did)
-        .executeTakeFirst();
-
-      if (!community) {
-        return res.status(404).json({ error: 'Community not found' });
-      }
-
-      const communityAgent = await createCommunityAgent(db, did);
-
-      // Check member and admin status independently.
-      // Admins are always considered members even if they lack a membershipProof
-      // (e.g. community created before proof records were introduced).
-      const memberCheck = await isMember(communityAgent, did, user_did);
-      const adminCheck = await isAdmin(communityAgent, did, user_did);
-
-      res.json({
-        is_member: memberCheck || adminCheck,
-        is_admin: adminCheck,
-      });
-    } catch (error: any) {
-      console.error('Error checking membership:', error);
-      res.status(500).json({ error: error.message || 'Failed to check membership' });
     }
   });
 

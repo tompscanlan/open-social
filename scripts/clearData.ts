@@ -4,7 +4,7 @@
  *
  * This script will:
  *   - For a community DID (found in the local DB):
- *     1. Delete all community.opensocial.member records (from the community's repo)
+ *     1. Delete all community.opensocial.membershipProof records (from the community's repo)
  *     2. Delete the community.opensocial.admins record
  *     3. Delete the community.opensocial.profile record
  *     4. Optionally remove the community row from the local database
@@ -254,15 +254,15 @@ async function clearCommunityData(
   });
   console.log('🔑 Authenticated as community account.\n');
 
-  // 1. Delete all community.opensocial.member records (tid-keyed)
-  console.log('── community.opensocial.member ──');
-  const members = await listRecords(agent, community.did, 'community.opensocial.member');
+  // 1. Delete all community.opensocial.membershipProof records (tid-keyed)
+  console.log('── community.opensocial.membershipProof ──');
+  const members = await listRecords(agent, community.did, 'community.opensocial.membershipProof');
   if (members.length === 0) {
     console.log('  No member records found.');
   } else {
     console.log(`  Found ${members.length} member record(s).`);
     for (const rec of members) {
-      await deleteRecord(agent, community.did, 'community.opensocial.member', rec.rkey, dryRun);
+      await deleteRecord(agent, community.did, 'community.opensocial.membershipProof', rec.rkey, dryRun);
     }
   }
 

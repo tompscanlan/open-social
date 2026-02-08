@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import { sql } from 'kysely';
 import { config } from './config';
@@ -10,6 +11,9 @@ import { createAppRouter } from './routes/apps';
 import { createCommunityRouter } from './routes/communities';
 import { createMemberRouter } from './routes/members';
 import { createRecordsRouter } from './routes/records';
+import { createWebhookRouter } from './routes/webhooks';
+import { createRateLimiter } from './middleware/rateLimit';
+import { csrfProtection } from './middleware/csrf';
 
 dotenv.config();
 
@@ -25,6 +29,7 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
 
 // Request logging
 app.use((req, res, next) => {
@@ -93,11 +98,70 @@ async function start() {
 
     console.log('✅ Database tables ready');
 
+    // Create new tables for v2 features
+    await db.schema
+      .createTable('rate_limits')
+      .ifNotExists()
+      .addColumn('id', 'serial', (col) => col.primaryKey())
+      .addColumn('app_id', 'varchar(255)', (col) => col.notNull().unique())
+      .addColumn('max_requests', 'integer', (col) => col.notNull().defaultTo(100))
+      .addColumn('window_ms', 'integer', (col) => col.notNull().defaultTo(60000))
+      .addColumn('created_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .addColumn('updated_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .execute();
+
+    await db.schema
+      .createTable('webhooks')
+      .ifNotExists()
+      .addColumn('id', 'serial', (col) => col.primaryKey())
+      .addColumn('app_id', 'varchar(255)', (col) => col.notNull())
+      .addColumn('url', 'text', (col) => col.notNull())
+      .addColumn('events', 'text', (col) => col.notNull()) // JSON array
+      .addColumn('secret', 'varchar(255)')
+      .addColumn('community_did', 'varchar(255)')
+      .addColumn('active', 'boolean', (col) => col.notNull().defaultTo(true))
+      .addColumn('created_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .addColumn('updated_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .execute();
+
+    await db.schema
+      .createTable('audit_log')
+      .ifNotExists()
+      .addColumn('id', 'serial', (col) => col.primaryKey())
+      .addColumn('community_did', 'varchar(255)', (col) => col.notNull())
+      .addColumn('admin_did', 'varchar(255)', (col) => col.notNull())
+      .addColumn('action', 'varchar(100)', (col) => col.notNull())
+      .addColumn('target_did', 'varchar(255)')
+      .addColumn('reason', 'text')
+      .addColumn('metadata', 'text') // JSON
+      .addColumn('created_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .execute();
+
+    await db.schema
+      .createTable('pending_members')
+      .ifNotExists()
+      .addColumn('id', 'serial', (col) => col.primaryKey())
+      .addColumn('community_did', 'varchar(255)', (col) => col.notNull())
+      .addColumn('user_did', 'varchar(255)', (col) => col.notNull())
+      .addColumn('status', 'varchar(50)', (col) => col.notNull().defaultTo('pending'))
+      .addColumn('reason', 'text')
+      .addColumn('reviewed_by', 'varchar(255)')
+      .addColumn('created_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .addColumn('updated_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .execute();
+
+    console.log('✅ V2 tables ready');
+
     // Initialize OAuth client
     const oauthClient = await createOAuthClient(db);
     console.log('✅ OAuth client initialized');
 
-    // Auth routes
+    // Apply global middleware
+    const rateLimiter = createRateLimiter(db);
+    app.use('/api/', rateLimiter);
+    app.use(csrfProtection);
+
+    // Auth routes (OAuth)
     app.use(createAuthRouter(oauthClient, db));
 
     // API routes
@@ -113,6 +177,7 @@ async function start() {
     app.use('/api/v1/communities', createCommunityRouter(db));
     app.use('/api/v1/communities', createMemberRouter(db));
     app.use('/api/v1/communities', createRecordsRouter(db));
+    app.use('/api/v1/webhooks', createWebhookRouter(db));
 
     // Error handling
     app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {

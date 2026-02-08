@@ -8,6 +8,7 @@ import { config } from '../config';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
 import { hashApiKey } from '../lib/crypto';
+import { registerAppSchema, updateAppSchema } from '../validation/schemas';
 
 type Session = { did?: string };
 
@@ -54,13 +55,11 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
         return res.status(401).json({ error: 'Not authenticated. Log in to register an app.' });
       }
 
-      const { name, domain } = req.body;
-      if (!name || !domain) {
-        return res.status(400).json({ error: 'Missing required fields: name, domain' });
+      const parsed = registerAppSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
-      if (typeof domain !== 'string' || !domain.includes('.')) {
-        return res.status(400).json({ error: 'Invalid domain format' });
-      }
+      const { name, domain } = parsed.data;
 
       // Check for duplicate domain
       const existing = await db
@@ -93,11 +92,11 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
 
       return res.json({
         app: {
-          app_id: appId,
+          appId,
           name,
           domain,
-          api_key: apiKey,
-          created_at: new Date().toISOString(),
+          apiKey,
+          createdAt: new Date().toISOString(),
         },
         message: 'Store the api_key securely — treat it like a password.',
       });
@@ -163,10 +162,11 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
         return res.status(401).json({ error: 'Not authenticated' });
       }
 
-      const { name, domain } = req.body;
-      if (!name && !domain) {
-        return res.status(400).json({ error: 'Provide at least one field to update: name, domain' });
+      const parsed = updateAppSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
+      const { name, domain } = parsed.data;
 
       const existing = await db
         .selectFrom('apps')
@@ -267,7 +267,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
         .execute();
 
       return res.json({
-        api_key: newApiKey,
+        apiKey: newApiKey,
         message: 'Store the new api_key securely. The old key is now invalid.',
       });
     } catch (err) {
@@ -298,7 +298,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
       return res.json({
         valid: true,
         app: {
-          app_id: app.app_id,
+          appId: app.app_id,
           name: app.name,
           domain: app.domain,
         },

@@ -10,6 +10,7 @@ import type { Kysely } from 'kysely';
 import type { Database } from '../db';
 import { config } from '../config';
 import { SessionStore, StateStore } from './storage';
+import { OPENSOCIAL_SCOPES } from '../middleware/auth';
 
 export async function createOAuthClient(db: Kysely<Database>) {
   // Confidential client requires a keyset accessible on the internet
@@ -38,7 +39,7 @@ export async function createOAuthClient(db: Kysely<Database>) {
         client_id: `${config.serviceUrl}/oauth-client-metadata.json`,
         jwks_uri: `${config.serviceUrl}/.well-known/jwks.json`,
         redirect_uris: [`${config.serviceUrl}/oauth/callback`],
-        scope: 'atproto transition:generic',
+        scope: OPENSOCIAL_SCOPES,
         grant_types: ['authorization_code', 'refresh_token'],
         response_types: ['code'],
         application_type: 'web',
@@ -49,7 +50,7 @@ export async function createOAuthClient(db: Kysely<Database>) {
     : atprotoLoopbackClientMetadata(
         `http://localhost?${new URLSearchParams([
           ['redirect_uri', `http://127.0.0.1:${config.port}/oauth/callback`],
-          ['scope', `atproto transition:generic`],
+          ['scope', OPENSOCIAL_SCOPES],
         ])}`
       );
 
