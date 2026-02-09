@@ -12,6 +12,7 @@ import { createCommunityRouter } from './routes/communities';
 import { createMemberRouter } from './routes/members';
 import { createRecordsRouter } from './routes/records';
 import { createWebhookRouter } from './routes/webhooks';
+import { createPermissionsRouter } from './routes/permissions';
 import { createRateLimiter } from './middleware/rateLimit';
 import { csrfProtection } from './middleware/csrf';
 
@@ -75,6 +76,26 @@ async function start() {
     try {
       await sql`ALTER TABLE communities ADD COLUMN IF NOT EXISTS display_name varchar(255) NOT NULL DEFAULT ''`.execute(db);
     } catch (e) { /* column already exists */ }
+
+    // ─── Search: enable pg_trgm and add trigram indexes ─────────────
+    try {
+      await sql`CREATE EXTENSION IF NOT EXISTS pg_trgm`.execute(db);
+    } catch (e) { console.warn('Could not create pg_trgm extension:', e); }
+
+    // Migrate: add cached metadata columns for community search results
+    try {
+      await sql`ALTER TABLE communities ADD COLUMN IF NOT EXISTS description text`.execute(db);
+      await sql`ALTER TABLE communities ADD COLUMN IF NOT EXISTS avatar_url text`.execute(db);
+      await sql`ALTER TABLE communities ADD COLUMN IF NOT EXISTS community_type varchar(50)`.execute(db);
+      await sql`ALTER TABLE communities ADD COLUMN IF NOT EXISTS member_count integer`.execute(db);
+      await sql`ALTER TABLE communities ADD COLUMN IF NOT EXISTS metadata_fetched_at timestamp`.execute(db);
+    } catch (e) { /* columns already exist */ }
+
+    // GIN trigram indexes for fuzzy search
+    try {
+      await sql`CREATE INDEX IF NOT EXISTS idx_communities_handle_trgm ON communities USING gin (handle gin_trgm_ops)`.execute(db);
+      await sql`CREATE INDEX IF NOT EXISTS idx_communities_display_name_trgm ON communities USING gin (display_name gin_trgm_ops)`.execute(db);
+    } catch (e) { console.warn('Could not create trigram indexes:', e); }
 
     // Migrate: drop legacy api_secret_hash column if it still exists
     try {
@@ -152,6 +173,117 @@ async function start() {
 
     console.log('✅ V2 tables ready');
 
+    // ─── Permissions & moderation tables ─────────────────────────────
+
+    await db.schema
+      .createTable('community_settings')
+      .ifNotExists()
+      .addColumn('id', 'serial', (col) => col.primaryKey())
+      .addColumn('community_did', 'varchar(255)', (col) => col.notNull().unique())
+      .addColumn('app_visibility_default', 'varchar(50)', (col) => col.notNull().defaultTo('open'))
+      .addColumn('blocked_app_ids', 'text', (col) => col.notNull().defaultTo('[]'))
+      .addColumn('created_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .addColumn('updated_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .execute();
+
+    await db.schema
+      .createTable('community_app_visibility')
+      .ifNotExists()
+      .addColumn('id', 'serial', (col) => col.primaryKey())
+      .addColumn('community_did', 'varchar(255)', (col) => col.notNull())
+      .addColumn('app_id', 'varchar(255)', (col) => col.notNull())
+      .addColumn('status', 'varchar(50)', (col) => col.notNull().defaultTo('enabled'))
+      .addColumn('requested_by', 'varchar(255)')
+      .addColumn('reviewed_by', 'varchar(255)')
+      .addColumn('created_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .addColumn('updated_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .execute();
+
+    // Unique constraint: one visibility row per (community, app)
+    try {
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_community_app_visibility_unique ON community_app_visibility (community_did, app_id)`.execute(db);
+    } catch (e) { /* index already exists */ }
+
+    await db.schema
+      .createTable('community_roles')
+      .ifNotExists()
+      .addColumn('id', 'serial', (col) => col.primaryKey())
+      .addColumn('community_did', 'varchar(255)', (col) => col.notNull())
+      .addColumn('name', 'varchar(100)', (col) => col.notNull())
+      .addColumn('display_name', 'varchar(255)', (col) => col.notNull())
+      .addColumn('description', 'text')
+      .addColumn('visible', 'boolean', (col) => col.notNull().defaultTo(false))
+      .addColumn('can_view_audit_log', 'boolean', (col) => col.notNull().defaultTo(false))
+      .addColumn('created_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .addColumn('updated_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .execute();
+
+    // Add can_view_audit_log column if it doesn't exist (migration for existing DBs)
+    try {
+      await sql`ALTER TABLE community_roles ADD COLUMN IF NOT EXISTS can_view_audit_log boolean NOT NULL DEFAULT false`.execute(db);
+    } catch (e) { /* column already exists */ }
+
+    // Unique constraint: role names are unique per community
+    try {
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_community_roles_unique ON community_roles (community_did, name)`.execute(db);
+    } catch (e) { /* index already exists */ }
+
+    await db.schema
+      .createTable('community_member_roles')
+      .ifNotExists()
+      .addColumn('id', 'serial', (col) => col.primaryKey())
+      .addColumn('community_did', 'varchar(255)', (col) => col.notNull())
+      .addColumn('member_did', 'varchar(255)', (col) => col.notNull())
+      .addColumn('role_name', 'varchar(100)', (col) => col.notNull())
+      .addColumn('assigned_by', 'varchar(255)', (col) => col.notNull())
+      .addColumn('created_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .execute();
+
+    // Unique constraint: a member can hold a given role only once per community
+    try {
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_community_member_roles_unique ON community_member_roles (community_did, member_did, role_name)`.execute(db);
+    } catch (e) { /* index already exists */ }
+
+    await db.schema
+      .createTable('app_default_permissions')
+      .ifNotExists()
+      .addColumn('id', 'serial', (col) => col.primaryKey())
+      .addColumn('app_id', 'varchar(255)', (col) => col.notNull())
+      .addColumn('collection', 'varchar(255)', (col) => col.notNull())
+      .addColumn('default_can_create', 'varchar(100)', (col) => col.notNull().defaultTo('member'))
+      .addColumn('default_can_read', 'varchar(100)', (col) => col.notNull().defaultTo('member'))
+      .addColumn('default_can_update', 'varchar(100)', (col) => col.notNull().defaultTo('member'))
+      .addColumn('default_can_delete', 'varchar(100)', (col) => col.notNull().defaultTo('admin'))
+      .addColumn('created_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .execute();
+
+    // Unique constraint: one default permission row per (app, collection)
+    try {
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_app_default_permissions_unique ON app_default_permissions (app_id, collection)`.execute(db);
+    } catch (e) { /* index already exists */ }
+
+    await db.schema
+      .createTable('community_app_collection_permissions')
+      .ifNotExists()
+      .addColumn('id', 'serial', (col) => col.primaryKey())
+      .addColumn('community_did', 'varchar(255)', (col) => col.notNull())
+      .addColumn('app_id', 'varchar(255)', (col) => col.notNull())
+      .addColumn('collection', 'varchar(255)', (col) => col.notNull())
+      .addColumn('can_create', 'varchar(100)', (col) => col.notNull().defaultTo('member'))
+      .addColumn('can_read', 'varchar(100)', (col) => col.notNull().defaultTo('member'))
+      .addColumn('can_update', 'varchar(100)', (col) => col.notNull().defaultTo('member'))
+      .addColumn('can_delete', 'varchar(100)', (col) => col.notNull().defaultTo('admin'))
+      .addColumn('created_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .addColumn('updated_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
+      .execute();
+
+    // Unique constraint: one permission row per (community, app, collection)
+    try {
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_community_app_collection_perms_unique ON community_app_collection_permissions (community_did, app_id, collection)`.execute(db);
+    } catch (e) { /* index already exists */ }
+
+    console.log('✅ Permissions tables ready');
+
     // Initialize OAuth client
     const oauthClient = await createOAuthClient(db);
     console.log('✅ OAuth client initialized');
@@ -177,6 +309,7 @@ async function start() {
     app.use('/api/v1/communities', createCommunityRouter(db));
     app.use('/api/v1/communities', createMemberRouter(db));
     app.use('/api/v1/communities', createRecordsRouter(db));
+    app.use('/api/v1/communities', createPermissionsRouter(db));
     app.use('/api/v1/webhooks', createWebhookRouter(db));
 
     // Error handling

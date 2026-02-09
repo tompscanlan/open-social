@@ -4,9 +4,9 @@ import type { Kysely } from 'kysely';
 import type { Database } from '../db';
 import type { AuthenticatedRequest } from './auth';
 
-// Default rate limit: 100 requests per minute per app
+// Default rate limit: 1000 requests per minute per app
 const DEFAULT_WINDOW_MS = 60 * 1000;
-const DEFAULT_MAX_REQUESTS = 100;
+const DEFAULT_MAX_REQUESTS = 1000;
 
 export function createRateLimiter(db: Kysely<Database>) {
   return rateLimit({

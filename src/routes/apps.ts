@@ -8,7 +8,7 @@ import { config } from '../config';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
 import { hashApiKey } from '../lib/crypto';
-import { registerAppSchema, updateAppSchema } from '../validation/schemas';
+import { registerAppWithPermissionsSchema, updateAppSchema, appDefaultPermissionSchema } from '../validation/schemas';
 
 type Session = { did?: string };
 
@@ -55,11 +55,11 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
         return res.status(401).json({ error: 'Not authenticated. Log in to register an app.' });
       }
 
-      const parsed = registerAppSchema.safeParse(req.body);
+      const parsed = registerAppWithPermissionsSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
-      const { name, domain } = parsed.data;
+      const { name, domain, defaultPermissions } = parsed.data;
 
       // Check for duplicate domain
       const existing = await db
@@ -89,6 +89,23 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
           status: 'active',
         })
         .execute();
+
+      // Store default collection permissions if provided
+      if (defaultPermissions && defaultPermissions.length > 0) {
+        for (const perm of defaultPermissions) {
+          await db
+            .insertInto('app_default_permissions')
+            .values({
+              app_id: appId,
+              collection: perm.collection,
+              default_can_create: perm.defaultCanCreate,
+              default_can_read: perm.defaultCanRead,
+              default_can_update: perm.defaultCanUpdate,
+              default_can_delete: perm.defaultCanDelete,
+            })
+            .execute();
+        }
+      }
 
       return res.json({
         app: {
@@ -306,6 +323,310 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
     } catch (err) {
       console.error('Error verifying credentials:', err);
       return res.status(500).json({ error: 'Failed to verify credentials' });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Default permission CRUD for an app (only the app creator can manage these)
+  // ---------------------------------------------------------------------------
+
+  // List default permissions for an app
+  router.get('/:appId/default-permissions', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      // Ensure the caller owns the app
+      const app = await db
+        .selectFrom('apps')
+        .selectAll()
+        .where('app_id', '=', req.params.appId)
+        .where('creator_did', '=', agent.assertDid)
+        .executeTakeFirst();
+      if (!app) {
+        return res.status(404).json({ error: 'App not found' });
+      }
+
+      const permissions = await db
+        .selectFrom('app_default_permissions')
+        .selectAll()
+        .where('app_id', '=', req.params.appId)
+        .orderBy('collection', 'asc')
+        .execute();
+
+      return res.json({
+        permissions: permissions.map((p) => ({
+          collection: p.collection,
+          defaultCanCreate: p.default_can_create,
+          defaultCanRead: p.default_can_read,
+          defaultCanUpdate: p.default_can_update,
+          defaultCanDelete: p.default_can_delete,
+        })),
+      });
+    } catch (err) {
+      console.error('Error listing default permissions:', err);
+      return res.status(500).json({ error: 'Failed to list default permissions' });
+    }
+  });
+
+  // Create or update a default permission
+  router.post('/:appId/default-permissions', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const parsed = appDefaultPermissionSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
+      }
+
+      const app = await db
+        .selectFrom('apps')
+        .selectAll()
+        .where('app_id', '=', req.params.appId)
+        .where('creator_did', '=', agent.assertDid)
+        .where('status', '=', 'active')
+        .executeTakeFirst();
+      if (!app) {
+        return res.status(404).json({ error: 'App not found or inactive' });
+      }
+
+      const { collection, defaultCanCreate, defaultCanRead, defaultCanUpdate, defaultCanDelete } = parsed.data;
+
+      // Domain validation — collection must start with reversed app domain
+      const domainPrefix = app.domain.split('.').reverse().join('.') + '.';
+      if (!collection.startsWith(domainPrefix)) {
+        return res.status(400).json({ error: `Collection must start with "${domainPrefix}"` });
+      }
+
+      // Upsert
+      const existing = await db
+        .selectFrom('app_default_permissions')
+        .selectAll()
+        .where('app_id', '=', req.params.appId)
+        .where('collection', '=', collection)
+        .executeTakeFirst();
+
+      if (existing) {
+        await db
+          .updateTable('app_default_permissions')
+          .set({
+            default_can_create: defaultCanCreate,
+            default_can_read: defaultCanRead,
+            default_can_update: defaultCanUpdate,
+            default_can_delete: defaultCanDelete,
+          })
+          .where('app_id', '=', req.params.appId)
+          .where('collection', '=', collection)
+          .execute();
+      } else {
+        await db
+          .insertInto('app_default_permissions')
+          .values({
+            app_id: req.params.appId,
+            collection,
+            default_can_create: defaultCanCreate,
+            default_can_read: defaultCanRead,
+            default_can_update: defaultCanUpdate,
+            default_can_delete: defaultCanDelete,
+          })
+          .execute();
+      }
+
+      return res.json({ success: true });
+    } catch (err) {
+      console.error('Error creating/updating default permission:', err);
+      return res.status(500).json({ error: 'Failed to save default permission' });
+    }
+  });
+
+  // Update a specific field on a default permission
+  router.put('/:appId/default-permissions', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const { collection, ...fields } = req.body;
+      if (!collection) {
+        return res.status(400).json({ error: 'collection is required' });
+      }
+
+      const app = await db
+        .selectFrom('apps')
+        .selectAll()
+        .where('app_id', '=', req.params.appId)
+        .where('creator_did', '=', agent.assertDid)
+        .where('status', '=', 'active')
+        .executeTakeFirst();
+      if (!app) {
+        return res.status(404).json({ error: 'App not found or inactive' });
+      }
+
+      const updateValues: Record<string, string> = {};
+      if (fields.defaultCanCreate) updateValues.default_can_create = fields.defaultCanCreate;
+      if (fields.defaultCanRead) updateValues.default_can_read = fields.defaultCanRead;
+      if (fields.defaultCanUpdate) updateValues.default_can_update = fields.defaultCanUpdate;
+      if (fields.defaultCanDelete) updateValues.default_can_delete = fields.defaultCanDelete;
+
+      if (Object.keys(updateValues).length === 0) {
+        return res.status(400).json({ error: 'No valid fields to update' });
+      }
+
+      const result = await db
+        .updateTable('app_default_permissions')
+        .set(updateValues)
+        .where('app_id', '=', req.params.appId)
+        .where('collection', '=', collection)
+        .executeTakeFirst();
+
+      if (!result.numUpdatedRows || result.numUpdatedRows === 0n) {
+        return res.status(404).json({ error: 'Permission not found' });
+      }
+
+      return res.json({ success: true });
+    } catch (err) {
+      console.error('Error updating default permission:', err);
+      return res.status(500).json({ error: 'Failed to update default permission' });
+    }
+  });
+
+  // Delete a default permission
+  router.delete('/:appId/default-permissions', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const { collection } = req.body;
+      if (!collection) {
+        return res.status(400).json({ error: 'collection is required' });
+      }
+
+      const app = await db
+        .selectFrom('apps')
+        .selectAll()
+        .where('app_id', '=', req.params.appId)
+        .where('creator_did', '=', agent.assertDid)
+        .executeTakeFirst();
+      if (!app) {
+        return res.status(404).json({ error: 'App not found' });
+      }
+
+      await db
+        .deleteFrom('app_default_permissions')
+        .where('app_id', '=', req.params.appId)
+        .where('collection', '=', collection)
+        .execute();
+
+      return res.json({ success: true });
+    } catch (err) {
+      console.error('Error deleting default permission:', err);
+      return res.status(500).json({ error: 'Failed to delete default permission' });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // RATE LIMITS
+  // ═══════════════════════════════════════════════════════════════
+
+  // GET /:appId/rate-limit — get current rate limit for an app
+  router.get('/:appId/rate-limit', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const app = await db
+        .selectFrom('apps')
+        .selectAll()
+        .where('app_id', '=', req.params.appId)
+        .where('creator_did', '=', agent.assertDid)
+        .executeTakeFirst();
+      if (!app) {
+        return res.status(404).json({ error: 'App not found' });
+      }
+
+      const rateLimit = await db
+        .selectFrom('rate_limits')
+        .select(['max_requests', 'window_ms'])
+        .where('app_id', '=', req.params.appId)
+        .executeTakeFirst();
+
+      return res.json({
+        appId: req.params.appId,
+        maxRequests: rateLimit?.max_requests ?? 1000,
+        windowMs: rateLimit?.window_ms ?? 60000,
+        isCustom: !!rateLimit,
+      });
+    } catch (err) {
+      console.error('Error getting rate limit:', err);
+      return res.status(500).json({ error: 'Failed to get rate limit' });
+    }
+  });
+
+  // PUT /:appId/rate-limit — set a custom rate limit for an app
+  router.put('/:appId/rate-limit', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const { maxRequests, windowMs } = req.body;
+      if (!maxRequests || typeof maxRequests !== 'number' || maxRequests < 1) {
+        return res.status(400).json({ error: 'maxRequests must be a positive number' });
+      }
+
+      const app = await db
+        .selectFrom('apps')
+        .selectAll()
+        .where('app_id', '=', req.params.appId)
+        .where('creator_did', '=', agent.assertDid)
+        .where('status', '=', 'active')
+        .executeTakeFirst();
+      if (!app) {
+        return res.status(404).json({ error: 'App not found or inactive' });
+      }
+
+      const effectiveWindowMs = windowMs && typeof windowMs === 'number' ? windowMs : 60000;
+
+      // Upsert the rate limit
+      const existing = await db
+        .selectFrom('rate_limits')
+        .select('id')
+        .where('app_id', '=', req.params.appId)
+        .executeTakeFirst();
+
+      if (existing) {
+        await db
+          .updateTable('rate_limits')
+          .set({ max_requests: maxRequests, window_ms: effectiveWindowMs, updated_at: new Date() })
+          .where('app_id', '=', req.params.appId)
+          .execute();
+      } else {
+        await db
+          .insertInto('rate_limits')
+          .values({ app_id: req.params.appId, max_requests: maxRequests, window_ms: effectiveWindowMs })
+          .execute();
+      }
+
+      return res.json({
+        success: true,
+        appId: req.params.appId,
+        maxRequests,
+        windowMs: effectiveWindowMs,
+      });
+    } catch (err) {
+      console.error('Error setting rate limit:', err);
+      return res.status(500).json({ error: 'Failed to set rate limit' });
     }
   });
 

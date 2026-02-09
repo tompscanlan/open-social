@@ -22,18 +22,18 @@ import { createWebhookService } from '../services/webhook';
 import { config } from '../config';
 
 /**
- * Resolve a Bluesky profile to get handle and avatar.
+ * Resolve a Bluesky profile to get handle, display name, and avatar.
  * Falls back gracefully if the user's PDS is unreachable.
  */
-async function resolveProfile(did: string): Promise<{ handle: string | null; avatar: string | null }> {
+async function resolveProfile(did: string): Promise<{ handle: string | null; displayName: string | null; avatar: string | null }> {
   try {
     const res = await fetch(`https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=${encodeURIComponent(did)}`);
     if (res.ok) {
       const data = await res.json() as any;
-      return { handle: data.handle || null, avatar: data.avatar || null };
+      return { handle: data.handle || null, displayName: data.displayName || null, avatar: data.avatar || null };
     }
   } catch {}
-  return { handle: null, avatar: null };
+  return { handle: null, displayName: null, avatar: null };
 }
 
 /**
@@ -351,12 +351,32 @@ export function createMemberRouter(db: Kysely<Database>): Router {
       const page = members.slice(offset, offset + limit);
       const hasMore = offset + limit < total;
 
-      // Resolve Bluesky profiles for this page
+      // Resolve Bluesky profiles for this page, and include visible roles
       const enriched = await Promise.all(
         page.map(async (member) => {
-          if (!member.did) return { ...member, handle: null, avatar: null };
+          if (!member.did) return { ...member, handle: null, displayName: null, avatar: null, roles: [] };
           const profile = await resolveProfile(member.did);
-          return { ...member, ...profile };
+
+          // Fetch visible custom roles from the database
+          const visibleRoleRows = await db
+            .selectFrom('community_member_roles')
+            .innerJoin('community_roles', (join) =>
+              join
+                .onRef('community_member_roles.community_did', '=', 'community_roles.community_did')
+                .onRef('community_member_roles.role_name', '=', 'community_roles.name')
+            )
+            .select(['community_member_roles.role_name', 'community_roles.display_name'])
+            .where('community_member_roles.community_did', '=', communityDid)
+            .where('community_member_roles.member_did', '=', member.did)
+            .where('community_roles.visible', '=', true)
+            .execute();
+
+          const roles = visibleRoleRows.map((r) => ({
+            name: r.role_name,
+            displayName: r.display_name,
+          }));
+
+          return { ...member, ...profile, roles };
         })
       );
 

@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import type { Kysely } from 'kysely';
+import { sql, type Kysely } from 'kysely';
 import type { Database } from '../db';
 import { createVerifyApiKey, type AuthenticatedRequest } from '../middleware/auth';
 import {
@@ -14,6 +14,7 @@ import { encrypt } from '../lib/crypto';
 import { createAuditLogService } from '../services/auditLog';
 import { createWebhookService } from '../services/webhook';
 import { createCommunityAgent } from '../services/atproto';
+import { checkAppVisibility } from '../services/permissions';
 import { config } from '../config';
 
 export function createCommunityRouter(db: Kysely<Database>): Router {
@@ -178,18 +179,31 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
         .selectFrom('communities')
         .selectAll();
 
-      // Search by name or handle
-      if (query) {
+      // Search by name or handle — require at least 3 characters
+      const trimmedQuery = query?.trim();
+      if (trimmedQuery && trimmedQuery.length >= 3) {
+        // Fuzzy search: trigram similarity + ILIKE fallback
+        // All user input goes through Kysely parameterised bindings — safe from SQL injection
         dbQuery = dbQuery.where((eb) =>
           eb.or([
-            eb('handle', 'ilike', `%${query}%`),
-            eb('display_name', 'ilike', `%${query}%`),
+            eb(sql`similarity(handle, ${trimmedQuery})`, '>', sql`0.15`),
+            eb(sql`similarity(display_name, ${trimmedQuery})`, '>', sql`0.15`),
+            sql<boolean>`handle ILIKE ${'%' + trimmedQuery + '%'}`,
+            sql<boolean>`display_name ILIKE ${'%' + trimmedQuery + '%'}`,
           ])
         );
+      } else if (trimmedQuery && trimmedQuery.length > 0 && trimmedQuery.length < 3) {
+        // Query too short — return empty
+        return res.json({ communities: [], cursor: undefined });
       }
 
       const allCommunities = await dbQuery
-        .orderBy('created_at', 'desc')
+        .orderBy(
+          trimmedQuery && trimmedQuery.length >= 3
+            ? sql`GREATEST(similarity(handle, ${trimmedQuery}), similarity(display_name, ${trimmedQuery}))`
+            : sql`COALESCE(member_count, 0)`,
+          'desc'
+        )
         .offset(offset)
         .limit(limit + 1)
         .execute();
@@ -198,8 +212,16 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
       const page = hasMore ? allCommunities.slice(0, limit) : allCommunities;
 
       // Enrich with profile data, admin status, and member count
-      const enriched = await Promise.all(
+      // Also filter out communities not visible to the requesting app
+      const appId = req.app_data?.app_id;
+      const enrichedUnfiltered = await Promise.all(
         page.map(async (community) => {
+          // Check app visibility
+          if (appId) {
+            const visibility = await checkAppVisibility(db, community.did, appId);
+            if (!visibility.allowed) return null;
+          }
+
           let isAdmin = false;
           let type = 'open';
           let memberCount = 0;
@@ -254,6 +276,17 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
             } catch {}
           } catch {}
 
+          // Update metadata cache (fire-and-forget)
+          db.updateTable('communities')
+            .set({
+              community_type: type,
+              member_count: memberCount,
+              metadata_fetched_at: new Date(),
+            })
+            .where('did', '=', community.did)
+            .execute()
+            .catch((err) => console.warn('Failed to update community metadata cache:', err));
+
           return {
             did: community.did,
             handle: community.handle,
@@ -266,6 +299,8 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
           };
         })
       );
+
+      const enriched = enrichedUnfiltered.filter(Boolean);
 
       res.json({
         communities: enriched,
@@ -291,6 +326,15 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
 
       if (!community) {
         return res.status(404).json({ error: 'Community not found' });
+      }
+
+      // App visibility gate
+      const appId = req.app_data?.app_id;
+      if (appId) {
+        const visibility = await checkAppVisibility(db, community.did, appId);
+        if (!visibility.allowed) {
+          return res.status(403).json({ error: visibility.reason });
+        }
       }
 
       let profile: any = {};
@@ -363,6 +407,130 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
     }
   });
 
+  /**
+   * GET /:did/permissions
+   * Return the collection permissions for the requesting app AND the user's
+   * effective roles in one response.  This lets the calling app resolve
+   * permissions client-side without multiple round-trips.
+   *
+   * Query params:
+   *   userDid  — optional. If provided, the user's roles are included.
+   */
+  router.get('/:did/permissions', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const userDid = req.query.userDid as string | undefined;
+      const appId = req.app_data?.app_id;
+
+      if (!appId) {
+        return res.status(401).json({ error: 'App identification required' });
+      }
+
+      // 1. App visibility gate
+      const visibility = await checkAppVisibility(db, communityDid, appId);
+      if (!visibility.allowed) {
+        return res.status(403).json({ error: visibility.reason });
+      }
+
+      // 2. Collection permissions for this app + community
+      //    First try community-level overrides, then fall back to app defaults.
+      let permRows = await db
+        .selectFrom('community_app_collection_permissions')
+        .selectAll()
+        .where('community_did', '=', communityDid)
+        .where('app_id', '=', appId)
+        .orderBy('collection', 'asc')
+        .execute();
+
+      let permissions;
+      if (permRows.length > 0) {
+        permissions = permRows.map((r) => ({
+          collection: r.collection,
+          canCreate: r.can_create,
+          canRead: r.can_read,
+          canUpdate: r.can_update,
+          canDelete: r.can_delete,
+        }));
+      } else {
+        // No community-level overrides — try app defaults
+        const defaultRows = await db
+          .selectFrom('app_default_permissions')
+          .selectAll()
+          .where('app_id', '=', appId)
+          .orderBy('collection', 'asc')
+          .execute();
+
+        permissions = defaultRows.map((r) => ({
+          collection: r.collection,
+          canCreate: r.default_can_create,
+          canRead: r.default_can_read,
+          canUpdate: r.default_can_update,
+          canDelete: r.default_can_delete,
+        }));
+      }
+
+      // 3. User roles (if userDid provided)
+      let userRoles: string[] = [];
+      if (userDid) {
+        // Check admin status from PDS
+        try {
+          const agent = await createCommunityAgent(db, communityDid);
+
+          // Membership
+          let isMember = false;
+          let cursor: string | undefined;
+          do {
+            const membersRes = await agent.api.com.atproto.repo.listRecords({
+              repo: communityDid,
+              collection: 'community.opensocial.membershipProof',
+              limit: 100,
+              cursor,
+            });
+            isMember = membersRes.data.records.some(
+              (r: any) => r.value.memberDid === userDid,
+            );
+            cursor = membersRes.data.cursor;
+          } while (cursor && !isMember);
+
+          if (isMember) userRoles.push('member');
+
+          // Admin
+          try {
+            const adminsRes = await agent.api.com.atproto.repo.getRecord({
+              repo: communityDid,
+              collection: 'community.opensocial.admins',
+              rkey: 'self',
+            });
+            const admins = (adminsRes.data.value as any)?.admins || [];
+            if (isAdminInList(userDid, admins)) {
+              userRoles.push('admin');
+            }
+          } catch {}
+        } catch (e) {
+          console.warn('Failed to resolve user roles from PDS:', e);
+        }
+
+        // Custom roles from DB
+        const customRoles = await db
+          .selectFrom('community_member_roles')
+          .select('role_name')
+          .where('community_did', '=', communityDid)
+          .where('member_did', '=', userDid)
+          .execute();
+        for (const r of customRoles) {
+          if (!userRoles.includes(r.role_name)) {
+            userRoles.push(r.role_name);
+          }
+        }
+      }
+
+      res.json({ permissions, userRoles });
+    } catch (error) {
+      console.error('Get permissions error:', error);
+      res.status(500).json({ error: 'Failed to get permissions' });
+    }
+  });
+
   // Delete community
   router.delete('/:did', verifyApiKey, async (req: AuthenticatedRequest, res) => {
     try {
@@ -407,6 +575,11 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
 
       await db.deleteFrom('communities').where('did', '=', communityDid).execute();
       await db.deleteFrom('pending_members').where('community_did', '=', communityDid).execute();
+      await db.deleteFrom('community_settings').where('community_did', '=', communityDid).execute();
+      await db.deleteFrom('community_app_visibility').where('community_did', '=', communityDid).execute();
+      await db.deleteFrom('community_app_collection_permissions').where('community_did', '=', communityDid).execute();
+      await db.deleteFrom('community_roles').where('community_did', '=', communityDid).execute();
+      await db.deleteFrom('community_member_roles').where('community_did', '=', communityDid).execute();
 
       await auditLog.log({
         communityDid,

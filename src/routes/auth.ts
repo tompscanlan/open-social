@@ -6,12 +6,15 @@ import type { NodeOAuthClient } from '@atproto/oauth-client-node';
 import crypto from 'crypto';
 import multer from 'multer';
 import { config } from '../config';
-import type { Kysely } from 'kysely';
+import { sql, type Kysely } from 'kysely';
 import type { Database } from '../db';
 import { ensureServiceUrl, createCommunityAgent } from '../services/atproto';
 import { isAdminInList, getOriginalAdminDid, normalizeAdmins } from '../lib/adminUtils';
 import { encrypt, decryptIfNeeded } from '../lib/crypto';
 import { hasScope, MEMBERSHIP_WRITE_SCOPE, OPENSOCIAL_SCOPES } from '../middleware/auth';
+import { checkAdmin, seedCollectionPermissions } from '../services/permissions';
+import { createAuditLogService } from '../services/auditLog';
+import { memberRolesCache } from '../lib/cache';
 
 // Configure multer for file uploads
 const upload = multer({
@@ -81,6 +84,20 @@ async function fetchBlueskyAvatar(did: string): Promise<string | undefined> {
 
 function ifString(val: unknown): string | undefined {
   return typeof val === 'string' && val.length > 0 ? val : undefined;
+}
+
+/**
+ * Resolve a Bluesky profile to get handle, display name, and avatar.
+ */
+async function resolveBlueskyProfile(did: string): Promise<{ handle: string | null; displayName: string | null; avatar: string | null }> {
+  try {
+    const res = await fetch(`https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=${encodeURIComponent(did)}`);
+    if (res.ok) {
+      const data = await res.json() as any;
+      return { handle: data.handle || null, displayName: data.displayName || null, avatar: data.avatar || null };
+    }
+  } catch {}
+  return { handle: null, displayName: null, avatar: null };
 }
 
 type Session = { did?: string };
@@ -523,13 +540,164 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
     }
   });
 
-  // Get community details
-  router.get('/communities/:did', async (req: Request, res: Response) => {
+  // ─── Search communities (fuzzy matching via pg_trgm) ────────────
+  router.get('/communities/search', async (req: Request, res: Response) => {
     try {
       const agent = await getSessionAgent(req, res, oauthClient);
       if (!agent) {
         return res.status(401).json({ error: 'Not authenticated' });
       }
+
+      const rawQuery = typeof req.query.query === 'string' ? req.query.query.trim()
+        : typeof req.query.q === 'string' ? req.query.q.trim()
+        : '';
+
+      // Require at least 3 characters for a search query
+      if (rawQuery.length > 0 && rawQuery.length < 3) {
+        return res.json({ communities: [] });
+      }
+
+      const limitParam = Number(req.query.limit) || 20;
+      const limit = Math.min(Math.max(limitParam, 1), 100);
+
+      const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
+      const now = Date.now();
+
+      let dbQuery = db
+        .selectFrom('communities')
+        .selectAll();
+
+      if (rawQuery.length >= 3) {
+        // Fuzzy search: combine trigram similarity with ILIKE fallback
+        // All user input goes through Kysely parameterised bindings — safe from SQL injection
+        dbQuery = dbQuery
+          .where((eb) =>
+            eb.or([
+              eb(sql`similarity(handle, ${rawQuery})`, '>', sql`0.15`),
+              eb(sql`similarity(display_name, ${rawQuery})`, '>', sql`0.15`),
+              sql<boolean>`handle ILIKE ${'%' + rawQuery + '%'}`,
+              sql<boolean>`display_name ILIKE ${'%' + rawQuery + '%'}`,
+            ])
+          )
+          .orderBy(
+            sql`GREATEST(similarity(handle, ${rawQuery}), similarity(display_name, ${rawQuery}))`,
+            'desc'
+          );
+      } else {
+        // No query — return top communities by member count
+        dbQuery = dbQuery.orderBy(sql`COALESCE(member_count, 0)`, 'desc');
+      }
+
+      const communities = await dbQuery
+        .limit(limit)
+        .execute();
+
+      // For each result, return cached metadata or refresh if stale (>24h)
+      const results = await Promise.all(
+        communities.map(async (c) => {
+          const stale = !c.metadata_fetched_at
+            || (now - new Date(c.metadata_fetched_at).getTime()) > TWENTY_FOUR_HOURS;
+
+          if (!stale && c.description !== null) {
+            return {
+              did: c.did,
+              handle: c.handle,
+              displayName: c.display_name,
+              description: c.description,
+              avatar: c.avatar_url,
+              type: c.community_type || 'open',
+              memberCount: c.member_count ?? 0,
+            };
+          }
+
+          // Refresh metadata from PDS
+          try {
+            const communityAgent = new BskyAgent({ service: c.pds_host });
+            await communityAgent.login({
+              identifier: c.handle,
+              password: decryptIfNeeded(c.app_password),
+            });
+
+            let description = '';
+            let avatarUrl: string | undefined;
+            let communityType = 'open';
+
+            try {
+              const profileRes = await communityAgent.api.com.atproto.repo.getRecord({
+                repo: c.did,
+                collection: 'community.opensocial.profile',
+                rkey: 'self',
+              });
+              const pv = profileRes.data.value as any;
+              description = pv.description || '';
+              communityType = pv.type || 'open';
+              avatarUrl = blobToUrl(pv.avatar, c.did, c.pds_host)
+                || await fetchBlueskyAvatar(c.did);
+            } catch {}
+
+            let memberCount = 0;
+            try {
+              let cursor: string | undefined;
+              do {
+                const membersRes = await communityAgent.api.com.atproto.repo.listRecords({
+                  repo: c.did,
+                  collection: 'community.opensocial.membershipProof',
+                  limit: 100,
+                  cursor,
+                });
+                memberCount += membersRes.data.records.length;
+                cursor = membersRes.data.cursor;
+              } while (cursor);
+            } catch {}
+
+            // Update cache in database (fire-and-forget)
+            db.updateTable('communities')
+              .set({
+                description,
+                avatar_url: avatarUrl || null,
+                community_type: communityType,
+                member_count: memberCount,
+                metadata_fetched_at: new Date(),
+              })
+              .where('did', '=', c.did)
+              .execute()
+              .catch((err) => console.warn('Failed to update community metadata cache:', err));
+
+            return {
+              did: c.did,
+              handle: c.handle,
+              displayName: c.display_name,
+              description,
+              avatar: avatarUrl || null,
+              type: communityType,
+              memberCount,
+            };
+          } catch (err) {
+            // Return what we have from cache
+            return {
+              did: c.did,
+              handle: c.handle,
+              displayName: c.display_name,
+              description: c.description || '',
+              avatar: c.avatar_url || null,
+              type: c.community_type || 'open',
+              memberCount: c.member_count ?? 0,
+            };
+          }
+        })
+      );
+
+      return res.json({ communities: results });
+    } catch (err) {
+      console.error('Community search error:', err);
+      return res.status(500).json({ error: 'Search failed' });
+    }
+  });
+
+  // Get community details
+  router.get('/communities/:did', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
 
       const communityDid = decodeURIComponent(req.params.did);
 
@@ -579,7 +747,28 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       });
 
       const adminsValue = adminsResponse.data.value as { admins: string[] };
+
+      // If not authenticated, return public community info only
+      if (!agent) {
+        return res.json({
+          community: {
+            did: communityDid,
+            displayName: profileValue.displayName,
+            description: profileValue.description,
+            type: profileValue.type || 'open',
+            avatar: avatarUrl,
+          },
+          memberCount,
+          isAdmin: false,
+          isMember: false,
+          isPrimaryAdmin: false,
+          isAuthenticated: false,
+          userRole: undefined,
+        });
+      }
+
       const isAdmin = adminsValue.admins.includes(agent.assertDid);
+      const primaryAdminDid = getOriginalAdminDid(adminsValue.admins);
 
       // Get user's role from their membership record
       const membershipResponse = await agent.api.com.atproto.repo.listRecords({
@@ -594,16 +783,28 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       const userRole = userMembership ? (userMembership.value as MembershipRecord).role : undefined;
 
+      // Check if user is a confirmed member (has membershipProof)
+      const isMember = isAdmin || proofsResponse.data.records.some(
+        (proof: any) => {
+          // Check if this proof matches the user's membership CID
+          if (!userMembership) return false;
+          return proof.value.cid === userMembership.cid;
+        }
+      );
+
       return res.json({
         community: {
           did: communityDid,
           displayName: profileValue.displayName,
           description: profileValue.description,
-          type: profileValue.type || 'open', // Default to 'open' if not set
+          type: profileValue.type || 'open',
           avatar: avatarUrl,
         },
         memberCount,
         isAdmin,
+        isMember,
+        isPrimaryAdmin: agent.assertDid === primaryAdminDid,
+        isAuthenticated: true,
         userRole,
       });
     } catch (err) {
@@ -611,6 +812,138 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       return res.status(500).json({ 
         error: 'Failed to get community details',
         details: err instanceof Error ? err.message : 'Unknown error'
+      });
+    }
+  });
+
+  // Join a community (session-based, for web UI)
+  router.post('/communities/:did/join', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const communityDid = decodeURIComponent(req.params.did);
+
+      // Get community from database
+      const community = await db
+        .selectFrom('communities')
+        .selectAll()
+        .where('did', '=', communityDid)
+        .executeTakeFirst();
+
+      if (!community) {
+        return res.status(404).json({ error: 'Community not found' });
+      }
+
+      // Create community agent
+      const communityAgent = new BskyAgent({ service: community.pds_host });
+      await communityAgent.login({
+        identifier: community.handle,
+        password: decryptIfNeeded(community.app_password),
+      });
+
+      // Check if already a member
+      let cursor: string | undefined;
+      let alreadyMember = false;
+      do {
+        const response = await communityAgent.api.com.atproto.repo.listRecords({
+          repo: communityDid,
+          collection: 'community.opensocial.membershipProof',
+          limit: 100,
+          cursor,
+        });
+        alreadyMember = response.data.records.some(
+          (r: any) => r.value.memberDid === agent.assertDid
+        );
+        cursor = response.data.cursor;
+      } while (cursor && !alreadyMember);
+
+      if (alreadyMember) {
+        return res.json({ status: 'already_member', message: 'You are already a member of this community' });
+      }
+
+      // Check scope
+      const grantedScope = getAgentScope(agent);
+      if (grantedScope && !hasScope(grantedScope, MEMBERSHIP_WRITE_SCOPE)) {
+        return res.status(403).json({
+          error: 'Insufficient scope',
+          details: `Required scope: ${MEMBERSHIP_WRITE_SCOPE}. Please log out and log back in to grant the required permissions.`,
+        });
+      }
+
+      // Check community type
+      let communityType = 'open';
+      try {
+        const profileRes = await communityAgent.api.com.atproto.repo.getRecord({
+          repo: communityDid,
+          collection: 'community.opensocial.profile',
+          rkey: 'self',
+        });
+        communityType = (profileRes.data.value as any)?.type || 'open';
+      } catch {}
+
+      // Create membership record in user's repo
+      const membershipRecord = await agent.api.com.atproto.repo.createRecord({
+        repo: agent.assertDid,
+        collection: 'community.opensocial.membership',
+        record: {
+          $type: 'community.opensocial.membership',
+          community: communityDid,
+          role: 'member',
+          since: new Date().toISOString(),
+        },
+      });
+
+      if (communityType === 'admin-approved') {
+        // Add to pending_members table
+        const existing = await db
+          .selectFrom('pending_members')
+          .selectAll()
+          .where('community_did', '=', communityDid)
+          .where('user_did', '=', agent.assertDid)
+          .where('status', '=', 'pending')
+          .executeTakeFirst();
+
+        if (!existing) {
+          await db
+            .insertInto('pending_members')
+            .values({
+              community_did: communityDid,
+              user_did: agent.assertDid,
+              status: 'pending',
+            })
+            .execute();
+        }
+
+        return res.json({
+          status: 'pending',
+          message: 'Join request submitted. An admin must approve your request.',
+        });
+      }
+
+      // Open community — create membershipProof in community's repo
+      await communityAgent.api.com.atproto.repo.createRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.membershipProof',
+        record: {
+          $type: 'community.opensocial.membershipProof',
+          memberDid: agent.assertDid,
+          cid: membershipRecord.data.cid,
+          confirmedAt: new Date().toISOString(),
+        },
+      });
+
+      return res.json({
+        status: 'joined',
+        message: 'Successfully joined the community',
+      });
+    } catch (err) {
+      console.error('Failed to join community:', err);
+      return res.status(500).json({
+        error: 'Failed to join community',
+        details: err instanceof Error ? err.message : 'Unknown error',
       });
     }
   });
@@ -1025,14 +1358,77 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
           : false,
       }));
 
-      // Filter by DID search
+      // Filter by DID or handle search
       if (search) {
         members = members.filter(
           (m) => m.did && m.did.toLowerCase().includes(search.toLowerCase())
         );
       }
 
-      return res.json({ members, total: members.length });
+      // Resolve Bluesky profiles (handle + avatar) for each member
+      const enriched = await Promise.all(
+        members.map(async (member) => {
+          if (!member.did) return { ...member, handle: null, displayName: null, avatar: null };
+          const profile = await resolveBlueskyProfile(member.did);
+          return { ...member, ...profile };
+        })
+      );
+
+      // If search term didn't match a DID, also filter by resolved handle
+      let results = enriched;
+      if (search) {
+        const lowerSearch = search.toLowerCase();
+        results = enriched.filter(
+          (m) =>
+            (m.did && m.did.toLowerCase().includes(lowerSearch)) ||
+            (m.handle && m.handle.toLowerCase().includes(lowerSearch))
+        );
+      }
+
+      // Fetch custom role assignments for all members
+      const memberDids = results.map((m) => m.did).filter(Boolean) as string[];
+      let roleAssignments: { member_did: string; role_name: string }[] = [];
+      if (memberDids.length > 0) {
+        roleAssignments = await db
+          .selectFrom('community_member_roles')
+          .select(['member_did', 'role_name'])
+          .where('community_did', '=', communityDid)
+          .where('member_did', 'in', memberDids)
+          .execute();
+      }
+
+      // Fetch role display names
+      const roleNames = [...new Set(roleAssignments.map((r) => r.role_name))];
+      let roleDisplayNames: Record<string, string> = {};
+      if (roleNames.length > 0) {
+        const roles = await db
+          .selectFrom('community_roles')
+          .select(['name', 'display_name'])
+          .where('community_did', '=', communityDid)
+          .where('name', 'in', roleNames)
+          .execute();
+        roleDisplayNames = Object.fromEntries(roles.map((r) => [r.name, r.display_name]));
+      }
+
+      // Build per-member role arrays
+      const rolesByMember = new Map<string, { name: string; displayName: string }[]>();
+      for (const ra of roleAssignments) {
+        if (!rolesByMember.has(ra.member_did)) rolesByMember.set(ra.member_did, []);
+        rolesByMember.get(ra.member_did)!.push({
+          name: ra.role_name,
+          displayName: roleDisplayNames[ra.role_name] || ra.role_name,
+        });
+      }
+
+      const primaryAdminDid = getOriginalAdminDid(admins);
+
+      const resultsWithRoles = results.map((m) => ({
+        ...m,
+        roles: m.did ? rolesByMember.get(m.did) || [] : [],
+        isPrimaryAdmin: m.did === primaryAdminDid,
+      }));
+
+      return res.json({ members: resultsWithRoles, total: resultsWithRoles.length, primaryAdminDid });
     } catch (err) {
       console.error('Failed to list members:', err);
       return res.status(500).json({
@@ -1116,6 +1512,8 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         },
       });
 
+      await auditLog.log({ communityDid, adminDid: agent.assertDid, action: 'admin.promoted', targetDid: memberDid });
+
       return res.json({ success: true, admins: updatedAdmins });
     } catch (err) {
       console.error('Failed to promote member to admin:', err);
@@ -1188,6 +1586,8 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
           admins: updatedAdmins,
         },
       });
+
+      await auditLog.log({ communityDid, adminDid: agent.assertDid, action: 'admin.demoted', targetDid: memberDid });
 
       return res.json({ success: true, admins: updatedAdmins });
     } catch (err) {
@@ -1286,6 +1686,8 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         });
       }
 
+      await auditLog.log({ communityDid, adminDid: agent.assertDid, action: 'member.removed', targetDid: memberDid });
+
       return res.json({
         success: true,
         message: `Member ${memberDid} removed from community. Their membership record remains in their PDS but is no longer verified.`,
@@ -1296,6 +1698,629 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         error: 'Failed to remove member',
         details: err instanceof Error ? err.message : 'Unknown error',
       });
+    }
+  });
+
+  // Transfer primary admin to another admin
+  router.post('/communities/:did/transfer-admin', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) return res.status(401).json({ error: 'Not authenticated' });
+
+      const communityDid = decodeURIComponent(req.params.did);
+      const { newOwnerDid } = req.body;
+      if (!newOwnerDid) return res.status(400).json({ error: 'newOwnerDid is required' });
+
+      const communityAgent = await createCommunityAgent(db, communityDid);
+
+      const adminsResponse = await communityAgent.api.com.atproto.repo.getRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.admins',
+        rkey: 'self',
+      });
+      const admins = (adminsResponse.data.value as any).admins || [];
+
+      // Verify caller is the primary admin
+      const originalAdmin = getOriginalAdminDid(admins);
+      if (agent.assertDid !== originalAdmin) {
+        return res.status(403).json({ error: 'Only the primary admin can transfer ownership' });
+      }
+
+      // Verify new owner is already an admin
+      if (!isAdminInList(newOwnerDid, admins)) {
+        return res.status(400).json({ error: 'New owner must already be an admin. Promote them first.' });
+      }
+
+      // Reorder: new owner goes first (becomes primary)
+      const normalized = normalizeAdmins(admins);
+      const newOwnerEntry = normalized.find(a => a.did === newOwnerDid)!;
+      const rest = normalized.filter(a => a.did !== newOwnerDid);
+      const updatedAdmins = [newOwnerEntry, ...rest];
+
+      await communityAgent.api.com.atproto.repo.putRecord({
+        repo: communityDid,
+        collection: 'community.opensocial.admins',
+        rkey: 'self',
+        record: {
+          $type: 'community.opensocial.admins',
+          admins: updatedAdmins,
+        },
+      });
+
+      await auditLog.log({ communityDid, adminDid: agent.assertDid, action: 'admin.transferred', targetDid: newOwnerDid });
+
+      return res.json({ success: true, message: `Primary admin transferred to ${newOwnerDid}`, admins: updatedAdmins });
+    } catch (err) {
+      console.error('Failed to transfer admin:', err);
+      return res.status(500).json({ error: 'Failed to transfer admin role' });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // SESSION-AUTHENTICATED PERMISSION / SETTINGS / ROLES ROUTES
+  // ═══════════════════════════════════════════════════════════════════
+
+  const auditLog = createAuditLogService(db);
+
+  /** Helper: verify the session user is a community admin. Returns DID or null. */
+  async function requireSessionAdmin(
+    req: Request,
+    res: Response,
+    communityDid: string,
+  ): Promise<string | null> {
+    const agent = await getSessionAgent(req, res, oauthClient);
+    if (!agent) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return null;
+    }
+    const isAdm = await checkAdmin(
+      await createCommunityAgent(db, communityDid),
+      communityDid,
+      agent.assertDid,
+    );
+    if (!isAdm) {
+      res.status(403).json({ error: 'Not authorized. Must be an admin.' });
+      return null;
+    }
+    return agent.assertDid;
+  }
+
+  // ─── Community settings ────────────────────────────────────────────
+
+  router.get('/communities/:did/settings', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) return res.status(401).json({ error: 'Not authenticated' });
+
+      const communityDid = decodeURIComponent(req.params.did);
+      const settings = await db
+        .selectFrom('community_settings')
+        .selectAll()
+        .where('community_did', '=', communityDid)
+        .executeTakeFirst();
+
+      // Also fetch community type from ATProto profile
+      let communityType = 'open';
+      try {
+        const communityAgent = await createCommunityAgent(db, communityDid);
+        const profileRes = await communityAgent.api.com.atproto.repo.getRecord({
+          repo: communityDid,
+          collection: 'community.opensocial.profile',
+          rkey: 'self',
+        });
+        communityType = (profileRes.data.value as any).type || 'open';
+      } catch { /* profile may not exist yet */ }
+
+      if (!settings) {
+        return res.json({
+          settings: { communityDid, appVisibilityDefault: 'open', blockedAppIds: [], communityType },
+        });
+      }
+
+      res.json({
+        settings: {
+          communityDid: settings.community_did,
+          appVisibilityDefault: settings.app_visibility_default,
+          blockedAppIds: JSON.parse(settings.blocked_app_ids),
+          communityType,
+        },
+      });
+    } catch (error) {
+      console.error('Error getting community settings:', error);
+      res.status(500).json({ error: 'Failed to get community settings' });
+    }
+  });
+
+  router.put('/communities/:did/settings', async (req: Request, res: Response) => {
+    try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const adminDid = await requireSessionAdmin(req, res, communityDid);
+      if (!adminDid) return;
+
+      const { appVisibilityDefault, blockedAppIds, communityType } = req.body;
+
+      // Update DB settings (app visibility, blocked apps)
+      const existing = await db
+        .selectFrom('community_settings')
+        .selectAll()
+        .where('community_did', '=', communityDid)
+        .executeTakeFirst();
+
+      if (existing) {
+        const values: Record<string, any> = { updated_at: new Date() };
+        if (appVisibilityDefault) values.app_visibility_default = appVisibilityDefault;
+        if (blockedAppIds) values.blocked_app_ids = JSON.stringify(blockedAppIds);
+        await db.updateTable('community_settings').set(values).where('community_did', '=', communityDid).execute();
+      } else {
+        await db
+          .insertInto('community_settings')
+          .values({
+            community_did: communityDid,
+            app_visibility_default: appVisibilityDefault || 'open',
+            blocked_app_ids: blockedAppIds ? JSON.stringify(blockedAppIds) : '[]',
+          })
+          .execute();
+      }
+
+      // If communityType was provided, update the ATProto profile record
+      if (communityType && ['open', 'admin-approved', 'private'].includes(communityType)) {
+        try {
+          const communityAgent = await createCommunityAgent(db, communityDid);
+          const profileRes = await communityAgent.api.com.atproto.repo.getRecord({
+            repo: communityDid,
+            collection: 'community.opensocial.profile',
+            rkey: 'self',
+          });
+          const currentProfile = profileRes.data.value as any;
+          await communityAgent.api.com.atproto.repo.putRecord({
+            repo: communityDid,
+            collection: 'community.opensocial.profile',
+            rkey: 'self',
+            record: { ...currentProfile, $type: 'community.opensocial.profile', type: communityType },
+          });
+        } catch (err) {
+          console.error('Failed to update community type in profile:', err);
+        }
+      }
+
+      await auditLog.log({ communityDid, adminDid, action: 'settings.updated', metadata: { appVisibilityDefault, blockedAppIds, communityType } });
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Error updating community settings:', error);
+      res.status(500).json({ error: 'Failed to update community settings' });
+    }
+  });
+
+  // ─── App visibility ────────────────────────────────────────────────
+
+  router.get('/communities/:did/apps', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) return res.status(401).json({ error: 'Not authenticated' });
+
+      const communityDid = decodeURIComponent(req.params.did);
+
+      const rows = await db
+        .selectFrom('community_app_visibility')
+        .selectAll()
+        .where('community_did', '=', communityDid)
+        .orderBy('created_at', 'desc')
+        .execute();
+
+      const enriched = await Promise.all(
+        rows.map(async (row) => {
+          const app = await db.selectFrom('apps').select(['name', 'domain']).where('app_id', '=', row.app_id).executeTakeFirst();
+          return { appId: row.app_id, appName: app?.name || null, appDomain: app?.domain || null, status: row.status, reviewedBy: row.reviewed_by, createdAt: row.created_at, updatedAt: row.updated_at };
+        }),
+      );
+
+      // Also list all active apps so admins can discover apps to enable
+      const allApps = await db.selectFrom('apps').select(['app_id', 'name', 'domain']).where('status', '=', 'active').execute();
+
+      res.json({ apps: enriched, allApps });
+    } catch (error) {
+      console.error('Error listing app visibility:', error);
+      res.status(500).json({ error: 'Failed to list app visibility' });
+    }
+  });
+
+  router.put('/communities/:did/apps/:appId', async (req: Request, res: Response) => {
+    try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const appId = req.params.appId;
+      const adminDid = await requireSessionAdmin(req, res, communityDid);
+      if (!adminDid) return;
+
+      const { status } = req.body;
+      if (!['enabled', 'disabled', 'pending'].includes(status)) {
+        return res.status(400).json({ error: 'status must be enabled, disabled, or pending' });
+      }
+
+      const existing = await db
+        .selectFrom('community_app_visibility')
+        .selectAll()
+        .where('community_did', '=', communityDid)
+        .where('app_id', '=', appId)
+        .executeTakeFirst();
+
+      if (existing) {
+        await db.updateTable('community_app_visibility').set({ status, reviewed_by: adminDid, updated_at: new Date() }).where('id', '=', existing.id).execute();
+      } else {
+        await db.insertInto('community_app_visibility').values({ community_did: communityDid, app_id: appId, status, requested_by: adminDid, reviewed_by: adminDid }).execute();
+      }
+
+      if (status === 'enabled') await seedCollectionPermissions(db, communityDid, appId);
+
+      const actionMap = { enabled: 'app.visibility.enabled', disabled: 'app.visibility.disabled', pending: 'app.visibility.pending' } as const;
+      await auditLog.log({ communityDid, adminDid, action: actionMap[status as keyof typeof actionMap], metadata: { appId } });
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Error updating app visibility:', error);
+      res.status(500).json({ error: 'Failed to update app visibility' });
+    }
+  });
+
+  // ─── Collection permissions ────────────────────────────────────────
+
+  router.get('/communities/:did/apps/:appId/permissions', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) return res.status(401).json({ error: 'Not authenticated' });
+
+      const communityDid = decodeURIComponent(req.params.did);
+      const appId = req.params.appId;
+
+      const rows = await db
+        .selectFrom('community_app_collection_permissions')
+        .selectAll()
+        .where('community_did', '=', communityDid)
+        .where('app_id', '=', appId)
+        .orderBy('collection', 'asc')
+        .execute();
+
+      res.json({
+        permissions: rows.map((r) => ({
+          collection: r.collection,
+          canCreate: r.can_create,
+          canRead: r.can_read,
+          canUpdate: r.can_update,
+          canDelete: r.can_delete,
+        })),
+      });
+    } catch (error) {
+      console.error('Error listing collection permissions:', error);
+      res.status(500).json({ error: 'Failed to list collection permissions' });
+    }
+  });
+
+  router.put('/communities/:did/apps/:appId/permissions', async (req: Request, res: Response) => {
+    try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const appId = req.params.appId;
+      const adminDid = await requireSessionAdmin(req, res, communityDid);
+      if (!adminDid) return;
+
+      const { collection, canCreate, canRead, canUpdate, canDelete } = req.body;
+      if (!collection) return res.status(400).json({ error: 'collection is required' });
+
+      const existing = await db
+        .selectFrom('community_app_collection_permissions')
+        .selectAll()
+        .where('community_did', '=', communityDid)
+        .where('app_id', '=', appId)
+        .where('collection', '=', collection)
+        .executeTakeFirst();
+
+      if (existing) {
+        const updates: Record<string, any> = { updated_at: new Date() };
+        if (canCreate) updates.can_create = canCreate;
+        if (canRead) updates.can_read = canRead;
+        if (canUpdate) updates.can_update = canUpdate;
+        if (canDelete) updates.can_delete = canDelete;
+        await db.updateTable('community_app_collection_permissions').set(updates).where('id', '=', existing.id).execute();
+      } else {
+        await db.insertInto('community_app_collection_permissions').values({
+          community_did: communityDid,
+          app_id: appId,
+          collection,
+          can_create: canCreate || 'member',
+          can_read: canRead || 'member',
+          can_update: canUpdate || 'member',
+          can_delete: canDelete || 'admin',
+        }).execute();
+      }
+
+      await auditLog.log({ communityDid, adminDid, action: 'collection.permission.updated', metadata: { appId, collection } });
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Error setting collection permission:', error);
+      res.status(500).json({ error: 'Failed to set collection permission' });
+    }
+  });
+
+  router.delete('/communities/:did/apps/:appId/permissions', async (req: Request, res: Response) => {
+    try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const appId = req.params.appId;
+      const adminDid = await requireSessionAdmin(req, res, communityDid);
+      if (!adminDid) return;
+
+      const { collection } = req.body;
+      if (!collection) return res.status(400).json({ error: 'collection is required' });
+
+      await db
+        .deleteFrom('community_app_collection_permissions')
+        .where('community_did', '=', communityDid)
+        .where('app_id', '=', appId)
+        .where('collection', '=', collection)
+        .execute();
+
+      await auditLog.log({ communityDid, adminDid, action: 'collection.permission.deleted', metadata: { appId, collection } });
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Error deleting collection permission:', error);
+      res.status(500).json({ error: 'Failed to delete collection permission' });
+    }
+  });
+
+  // ─── Custom roles ──────────────────────────────────────────────────
+
+  router.get('/communities/:did/roles', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) return res.status(401).json({ error: 'Not authenticated' });
+
+      const communityDid = decodeURIComponent(req.params.did);
+      const roles = await db
+        .selectFrom('community_roles')
+        .selectAll()
+        .where('community_did', '=', communityDid)
+        .orderBy('name', 'asc')
+        .execute();
+
+      res.json({
+        roles: roles.map((r) => ({
+          name: r.name,
+          displayName: r.display_name,
+          description: r.description,
+          visible: r.visible,
+          canViewAuditLog: r.can_view_audit_log,
+          createdAt: r.created_at,
+        })),
+      });
+    } catch (error) {
+      console.error('Error listing roles:', error);
+      res.status(500).json({ error: 'Failed to list roles' });
+    }
+  });
+
+  router.post('/communities/:did/roles', async (req: Request, res: Response) => {
+    try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const adminDid = await requireSessionAdmin(req, res, communityDid);
+      if (!adminDid) return;
+
+      const { name, displayName, description, visible, canViewAuditLog } = req.body;
+      if (!name || !displayName) return res.status(400).json({ error: 'name and displayName are required' });
+      if (name === 'admin' || name === 'member') return res.status(400).json({ error: `"${name}" is a built-in role` });
+
+      const dup = await db.selectFrom('community_roles').select('id').where('community_did', '=', communityDid).where('name', '=', name).executeTakeFirst();
+      if (dup) return res.status(409).json({ error: `Role "${name}" already exists` });
+
+      await db.insertInto('community_roles').values({
+        community_did: communityDid,
+        name,
+        display_name: displayName,
+        description: description || null,
+        visible: visible ?? false,
+        can_view_audit_log: canViewAuditLog ?? false,
+      }).execute();
+
+      await auditLog.log({ communityDid, adminDid, action: 'role.created', metadata: { name, displayName, visible, canViewAuditLog } });
+      res.status(201).json({ success: true, role: { name, displayName, description, visible, canViewAuditLog } });
+    } catch (error) {
+      console.error('Error creating role:', error);
+      res.status(500).json({ error: 'Failed to create role' });
+    }
+  });
+
+  router.put('/communities/:did/roles/:roleName', async (req: Request, res: Response) => {
+    try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const roleName = req.params.roleName;
+      const adminDid = await requireSessionAdmin(req, res, communityDid);
+      if (!adminDid) return;
+
+      const { displayName, description, visible, canViewAuditLog } = req.body;
+      const updates: Record<string, any> = { updated_at: new Date() };
+      if (displayName !== undefined) updates.display_name = displayName;
+      if (description !== undefined) updates.description = description;
+      if (visible !== undefined) updates.visible = visible;
+      if (canViewAuditLog !== undefined) updates.can_view_audit_log = canViewAuditLog;
+
+      const result = await db.updateTable('community_roles').set(updates).where('community_did', '=', communityDid).where('name', '=', roleName).executeTakeFirst();
+      if (!result.numUpdatedRows || result.numUpdatedRows === 0n) return res.status(404).json({ error: 'Role not found' });
+
+      await auditLog.log({ communityDid, adminDid, action: 'role.updated', metadata: { roleName, displayName, description, visible } });
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Error updating role:', error);
+      res.status(500).json({ error: 'Failed to update role' });
+    }
+  });
+
+  router.delete('/communities/:did/roles/:roleName', async (req: Request, res: Response) => {
+    try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const roleName = req.params.roleName;
+      const adminDid = await requireSessionAdmin(req, res, communityDid);
+      if (!adminDid) return;
+
+      await db.deleteFrom('community_member_roles').where('community_did', '=', communityDid).where('role_name', '=', roleName).execute();
+      const result = await db.deleteFrom('community_roles').where('community_did', '=', communityDid).where('name', '=', roleName).executeTakeFirst();
+      if (!result.numDeletedRows || result.numDeletedRows === 0n) return res.status(404).json({ error: 'Role not found' });
+
+      memberRolesCache.invalidatePrefix(`${communityDid}:`);
+      await auditLog.log({ communityDid, adminDid, action: 'role.deleted', metadata: { roleName } });
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Error deleting role:', error);
+      res.status(500).json({ error: 'Failed to delete role' });
+    }
+  });
+
+  // ─── Role assignments ──────────────────────────────────────────────
+
+  router.get('/communities/:did/members/:memberDid/roles', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) return res.status(401).json({ error: 'Not authenticated' });
+
+      const communityDid = decodeURIComponent(req.params.did);
+      const memberDid = decodeURIComponent(req.params.memberDid);
+
+      const assignments = await db
+        .selectFrom('community_member_roles')
+        .select(['role_name', 'assigned_by', 'created_at'])
+        .where('community_did', '=', communityDid)
+        .where('member_did', '=', memberDid)
+        .execute();
+
+      res.json({
+        roles: assignments.map((r) => ({
+          roleName: r.role_name,
+          assignedBy: r.assigned_by,
+          assignedAt: r.created_at,
+        })),
+      });
+    } catch (error) {
+      console.error('Error listing member roles:', error);
+      res.status(500).json({ error: 'Failed to list member roles' });
+    }
+  });
+
+  router.post('/communities/:did/members/:memberDid/roles', async (req: Request, res: Response) => {
+    try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const memberDid = decodeURIComponent(req.params.memberDid);
+      const adminDid = await requireSessionAdmin(req, res, communityDid);
+      if (!adminDid) return;
+
+      const { roleName } = req.body;
+      if (!roleName) return res.status(400).json({ error: 'roleName is required' });
+
+      if (roleName !== 'admin' && roleName !== 'member') {
+        const role = await db.selectFrom('community_roles').select('id').where('community_did', '=', communityDid).where('name', '=', roleName).executeTakeFirst();
+        if (!role) return res.status(404).json({ error: `Role "${roleName}" does not exist` });
+      }
+
+      const dup = await db.selectFrom('community_member_roles').select('id').where('community_did', '=', communityDid).where('member_did', '=', memberDid).where('role_name', '=', roleName).executeTakeFirst();
+      if (dup) return res.status(409).json({ error: `Member already has role "${roleName}"` });
+
+      await db.insertInto('community_member_roles').values({ community_did: communityDid, member_did: memberDid, role_name: roleName, assigned_by: adminDid }).execute();
+      memberRolesCache.invalidate(`${communityDid}:${memberDid}`);
+
+      await auditLog.log({ communityDid, adminDid, action: 'role.assigned', targetDid: memberDid, metadata: { roleName } });
+      res.status(201).json({ success: true });
+    } catch (error) {
+      console.error('Error assigning role:', error);
+      res.status(500).json({ error: 'Failed to assign role' });
+    }
+  });
+
+  router.delete('/communities/:did/members/:memberDid/roles/:roleName', async (req: Request, res: Response) => {
+    try {
+      const communityDid = decodeURIComponent(req.params.did);
+      const memberDid = decodeURIComponent(req.params.memberDid);
+      const roleName = req.params.roleName;
+      const adminDid = await requireSessionAdmin(req, res, communityDid);
+      if (!adminDid) return;
+
+      const result = await db.deleteFrom('community_member_roles').where('community_did', '=', communityDid).where('member_did', '=', memberDid).where('role_name', '=', roleName).executeTakeFirst();
+      if (!result.numDeletedRows || result.numDeletedRows === 0n) return res.status(404).json({ error: 'Role assignment not found' });
+
+      memberRolesCache.invalidate(`${communityDid}:${memberDid}`);
+      await auditLog.log({ communityDid, adminDid, action: 'role.revoked', targetDid: memberDid, metadata: { roleName } });
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Error revoking role:', error);
+      res.status(500).json({ error: 'Failed to revoke role' });
+    }
+  });
+
+  // ─── Audit log viewing ─────────────────────────────────────────────
+
+  /**
+   * Check whether a user can view the audit log.
+   * Admins always can. Custom roles with can_view_audit_log=true can.
+   * Members (built-in) cannot by default.
+   */
+  async function canViewAuditLog(communityDid: string, userDid: string): Promise<boolean> {
+    // Check if admin
+    try {
+      const communityAgent = await createCommunityAgent(db, communityDid);
+      const isAdm = await checkAdmin(communityAgent, communityDid, userDid);
+      if (isAdm) return true;
+    } catch { /* not admin */ }
+
+    // Check custom roles assigned to user that have can_view_audit_log
+    const roleAssignments = await db
+      .selectFrom('community_member_roles')
+      .select('role_name')
+      .where('community_did', '=', communityDid)
+      .where('member_did', '=', userDid)
+      .execute();
+
+    if (roleAssignments.length === 0) return false;
+
+    const roleNames = roleAssignments.map((r) => r.role_name);
+    const matchingRoles = await db
+      .selectFrom('community_roles')
+      .select('name')
+      .where('community_did', '=', communityDid)
+      .where('name', 'in', roleNames)
+      .where('can_view_audit_log', '=', true)
+      .execute();
+
+    return matchingRoles.length > 0;
+  }
+
+  router.get('/communities/:did/audit-log', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) return res.status(401).json({ error: 'Not authenticated' });
+
+      const communityDid = decodeURIComponent(req.params.did);
+      const userDid = agent.assertDid;
+
+      const hasAccess = await canViewAuditLog(communityDid, userDid);
+      if (!hasAccess) {
+        return res.status(403).json({ error: 'Not authorized to view audit log' });
+      }
+
+      const cursor = req.query.cursor as string | undefined;
+      const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 20, 1), 100);
+
+      const result = await auditLog.query({ communityDid, cursor, limit });
+      res.json(result);
+    } catch (error) {
+      console.error('Error fetching audit log:', error);
+      res.status(500).json({ error: 'Failed to fetch audit log' });
+    }
+  });
+
+  // Return whether the current user can view the audit log (for UI gating)
+  router.get('/communities/:did/audit-log/access', async (req: Request, res: Response) => {
+    try {
+      const agent = await getSessionAgent(req, res, oauthClient);
+      if (!agent) return res.status(401).json({ error: 'Not authenticated' });
+
+      const communityDid = decodeURIComponent(req.params.did);
+      const hasAccess = await canViewAuditLog(communityDid, agent.assertDid);
+      res.json({ canViewAuditLog: hasAccess });
+    } catch (error) {
+      console.error('Error checking audit log access:', error);
+      res.status(500).json({ error: 'Failed to check audit log access' });
     }
   });
 

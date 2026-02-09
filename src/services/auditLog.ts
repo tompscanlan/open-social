@@ -13,7 +13,18 @@ export type AuditAction =
   | 'community.deleted'
   | 'community.updated'
   | 'banner.uploaded'
-  | 'avatar.uploaded';
+  | 'avatar.uploaded'
+  | 'settings.updated'
+  | 'app.visibility.enabled'
+  | 'app.visibility.disabled'
+  | 'app.visibility.pending'
+  | 'collection.permission.updated'
+  | 'collection.permission.deleted'
+  | 'role.created'
+  | 'role.updated'
+  | 'role.deleted'
+  | 'role.assigned'
+  | 'role.revoked';
 
 export function createAuditLogService(db: Kysely<Database>) {
   async function log(params: {

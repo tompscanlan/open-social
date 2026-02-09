@@ -9,71 +9,96 @@ import {
   listRecordsSchema,
   membershipCheckSchema,
 } from '../validation/schemas';
-import { isAdminInList } from '../lib/adminUtils';
 import { createCommunityAgent } from '../services/atproto';
 import { createWebhookService } from '../services/webhook';
-
-/**
- * Collections that only admins can write to.
- */
-const ADMIN_ONLY_COLLECTIONS = new Set([
-  'community.opensocial.listitem.status',
-  'community.opensocial.profile',
-  'community.opensocial.admins',
-]);
-
-/**
- * Collections that only admins can update (PUT).
- */
-const ADMIN_UPDATE_COLLECTIONS = new Set([
-  'community.opensocial.list',
-  'community.opensocial.listitem.status',
-  'community.opensocial.profile',
-  'community.opensocial.admins',
-]);
-
-/**
- * Check if a user DID is a member of a community by scanning membershipProof records.
- */
-async function isMember(communityAgent: any, communityDid: string, userDid: string): Promise<boolean> {
-  let cursor: string | undefined;
-  do {
-    const response = await communityAgent.api.com.atproto.repo.listRecords({
-      repo: communityDid,
-      collection: 'community.opensocial.membershipProof',
-      limit: 100,
-      cursor,
-    });
-    const found = response.data.records.some(
-      (r: any) => r.value.memberDid === userDid
-    );
-    if (found) return true;
-    cursor = response.data.cursor;
-  } while (cursor);
-  return false;
-}
-
-/**
- * Check if a user DID is an admin of a community.
- */
-async function isAdmin(communityAgent: any, communityDid: string, userDid: string): Promise<boolean> {
-  try {
-    const adminsResponse = await communityAgent.api.com.atproto.repo.getRecord({
-      repo: communityDid,
-      collection: 'community.opensocial.admins',
-      rkey: 'self',
-    });
-    const admins = (adminsResponse.data.value as any).admins || [];
-    return isAdminInList(userDid, admins);
-  } catch {
-    return false;
-  }
-}
+import {
+  checkAppVisibility,
+  getRequiredRole,
+  getUserRoles,
+  satisfiesRole,
+  type Operation,
+} from '../services/permissions';
 
 export function createRecordsRouter(db: Kysely<Database>): Router {
   const router = Router();
   const verifyApiKey = createVerifyApiKey(db);
   const webhooks = createWebhookService(db);
+
+  /**
+   * Shared helper: verify app visibility, resolve user roles, and check
+   * collection-level permission for the given operation.
+   *
+   * Returns an object with the communityAgent and userRoles on success,
+   * or sends an error response and returns null.
+   */
+  async function enforcePermission(
+    req: AuthenticatedRequest,
+    res: any,
+    communityDid: string,
+    userDid: string,
+    collection: string,
+    operation: Operation,
+  ) {
+    const appId = req.app_data?.app_id;
+    if (!appId) {
+      res.status(401).json({ error: 'App identification missing' });
+      return null;
+    }
+
+    // 1. App visibility gate
+    const visibility = await checkAppVisibility(db, communityDid, appId);
+    if (!visibility.allowed) {
+      res.status(403).json({ error: visibility.reason });
+      return null;
+    }
+
+    // 2. Community exists?
+    const community = await db
+      .selectFrom('communities')
+      .selectAll()
+      .where('did', '=', communityDid)
+      .executeTakeFirst();
+    if (!community) {
+      res.status(404).json({ error: 'Community not found' });
+      return null;
+    }
+
+    const communityAgent = await createCommunityAgent(db, communityDid);
+
+    // 3. Collection permission check
+    const requiredRole = await getRequiredRole(db, communityDid, appId, collection, operation);
+
+    // If no community-level permission row exists, check app defaults,
+    // then fall back to 'member' if neither exists.
+    let effectiveRequiredRole: string = requiredRole ?? '';
+    if (!effectiveRequiredRole) {
+      const col = `default_can_${operation}` as const;
+      const appDefault = await db
+        .selectFrom('app_default_permissions')
+        .select(col as any)
+        .where('app_id', '=', appId)
+        .where('collection', '=', collection)
+        .executeTakeFirst();
+      effectiveRequiredRole = appDefault ? (appDefault as any)[col] : 'member';
+    }
+
+    // 4. Resolve user's roles
+    const userRoles = await getUserRoles(db, communityDid, userDid, communityAgent);
+
+    if (userRoles.length === 0) {
+      res.status(403).json({ error: 'User is not a member of this community' });
+      return null;
+    }
+
+    if (!satisfiesRole(userRoles, effectiveRequiredRole)) {
+      res.status(403).json({
+        error: `Insufficient permissions. Required role: ${effectiveRequiredRole}`,
+      });
+      return null;
+    }
+
+    return { communityAgent, userRoles };
+  }
 
   /**
    * POST /communities/:did/records
@@ -91,29 +116,10 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
 
       const { userDid, collection, record, rkey } = parsed.data;
 
-      const community = await db
-        .selectFrom('communities')
-        .selectAll()
-        .where('did', '=', communityDid)
-        .executeTakeFirst();
+      const result = await enforcePermission(req, res, communityDid, userDid, collection, 'create');
+      if (!result) return;
 
-      if (!community) {
-        return res.status(404).json({ error: 'Community not found' });
-      }
-
-      const communityAgent = await createCommunityAgent(db, communityDid);
-
-      // Verify membership (admins are implicitly members)
-      const memberCheck = await isMember(communityAgent, communityDid, userDid);
-      const adminCheck = await isAdmin(communityAgent, communityDid, userDid);
-      if (!memberCheck && !adminCheck) {
-        return res.status(403).json({ error: 'User is not a member of this community' });
-      }
-
-      // Check admin-only collections
-      if (ADMIN_ONLY_COLLECTIONS.has(collection) && !adminCheck) {
-        return res.status(403).json({ error: 'Only admins can write to this collection' });
-      }
+      const { communityAgent } = result;
 
       const response = await communityAgent.api.com.atproto.repo.createRecord({
         repo: communityDid,
@@ -158,29 +164,10 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
 
       const { userDid, collection, rkey, record } = parsed.data;
 
-      const community = await db
-        .selectFrom('communities')
-        .selectAll()
-        .where('did', '=', communityDid)
-        .executeTakeFirst();
+      const result = await enforcePermission(req, res, communityDid, userDid, collection, 'update');
+      if (!result) return;
 
-      if (!community) {
-        return res.status(404).json({ error: 'Community not found' });
-      }
-
-      const communityAgent = await createCommunityAgent(db, communityDid);
-
-      // Verify membership
-      const memberCheck = await isMember(communityAgent, communityDid, userDid);
-      const adminCheck = await isAdmin(communityAgent, communityDid, userDid);
-      if (!memberCheck && !adminCheck) {
-        return res.status(403).json({ error: 'User is not a member of this community' });
-      }
-
-      // Check admin-update collections
-      if (ADMIN_UPDATE_COLLECTIONS.has(collection) && !adminCheck) {
-        return res.status(403).json({ error: 'Only admins can update records in this collection' });
-      }
+      const { communityAgent } = result;
 
       const response = await communityAgent.api.com.atproto.repo.putRecord({
         repo: communityDid,
@@ -227,29 +214,10 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
 
       const { userDid } = parsed.data;
 
-      const community = await db
-        .selectFrom('communities')
-        .selectAll()
-        .where('did', '=', communityDid)
-        .executeTakeFirst();
+      const result = await enforcePermission(req, res, communityDid, userDid, collection, 'delete');
+      if (!result) return;
 
-      if (!community) {
-        return res.status(404).json({ error: 'Community not found' });
-      }
-
-      const communityAgent = await createCommunityAgent(db, communityDid);
-
-      // Verify membership
-      const memberCheck = await isMember(communityAgent, communityDid, userDid);
-      const adminCheck = await isAdmin(communityAgent, communityDid, userDid);
-      if (!memberCheck && !adminCheck) {
-        return res.status(403).json({ error: 'User is not a member of this community' });
-      }
-
-      // Admin-only or admin-update collections need admin check for deletion
-      if ((ADMIN_ONLY_COLLECTIONS.has(collection) || ADMIN_UPDATE_COLLECTIONS.has(collection)) && !adminCheck) {
-        return res.status(403).json({ error: 'Only admins can delete records in this collection' });
-      }
+      const { communityAgent } = result;
 
       await communityAgent.api.com.atproto.repo.deleteRecord({
         repo: communityDid,
@@ -274,6 +242,8 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
   /**
    * GET /communities/:did/records/:collection
    * List records in a specific collection.
+   *
+   * Now subject to app visibility and read permission checks.
    */
   router.get('/:did/records/:collection', verifyApiKey, async (req: AuthenticatedRequest, res) => {
     try {
@@ -285,6 +255,16 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
       }
 
       const { limit, cursor } = parsed.data;
+      const userDid = req.query.userDid as string | undefined;
+      const appId = req.app_data?.app_id;
+
+      // App visibility gate
+      if (appId) {
+        const visibility = await checkAppVisibility(db, communityDid, appId);
+        if (!visibility.allowed) {
+          return res.status(403).json({ error: visibility.reason });
+        }
+      }
 
       const community = await db
         .selectFrom('communities')
@@ -297,6 +277,17 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
       }
 
       const communityAgent = await createCommunityAgent(db, communityDid);
+
+      // Check read permissions if a userDid is supplied and permission rows exist
+      if (userDid && appId) {
+        const requiredRole = await getRequiredRole(db, communityDid, appId, collection, 'read');
+        if (requiredRole) {
+          const userRoles = await getUserRoles(db, communityDid, userDid, communityAgent);
+          if (!satisfiesRole(userRoles, requiredRole)) {
+            return res.status(403).json({ error: `Insufficient permissions to read this collection. Required role: ${requiredRole}` });
+          }
+        }
+      }
 
       const response = await communityAgent.api.com.atproto.repo.listRecords({
         repo: communityDid,
@@ -323,6 +314,16 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
     try {
       const communityDid = decodeURIComponent(req.params.did);
       const { collection, rkey } = req.params;
+      const userDid = req.query.userDid as string | undefined;
+      const appId = req.app_data?.app_id;
+
+      // App visibility gate
+      if (appId) {
+        const visibility = await checkAppVisibility(db, communityDid, appId);
+        if (!visibility.allowed) {
+          return res.status(403).json({ error: visibility.reason });
+        }
+      }
 
       const community = await db
         .selectFrom('communities')
@@ -335,6 +336,17 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
       }
 
       const communityAgent = await createCommunityAgent(db, communityDid);
+
+      // Check read permissions if a userDid is supplied and permission rows exist
+      if (userDid && appId) {
+        const requiredRole = await getRequiredRole(db, communityDid, appId, collection, 'read');
+        if (requiredRole) {
+          const userRoles = await getUserRoles(db, communityDid, userDid, communityAgent);
+          if (!satisfiesRole(userRoles, requiredRole)) {
+            return res.status(403).json({ error: `Insufficient permissions to read this collection. Required role: ${requiredRole}` });
+          }
+        }
+      }
 
       const response = await communityAgent.api.com.atproto.repo.getRecord({
         repo: communityDid,

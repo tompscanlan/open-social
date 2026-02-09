@@ -172,3 +172,82 @@ export const auditLogQuerySchema = z.object({
   cursor: cursorSchema,
   limit: limitSchema,
 });
+
+// ─── Permissions & moderation schemas ─────────────────────────────────
+
+// Community settings
+export const updateCommunitySettingsSchema = z.object({
+  adminDid: didSchema,
+  appVisibilityDefault: z.enum(['open', 'approval_required']).optional(),
+  blockedAppIds: z.array(z.string()).optional(),
+});
+
+// App visibility management
+export const updateAppVisibilitySchema = z.object({
+  adminDid: didSchema,
+  status: z.enum(['enabled', 'disabled', 'pending']),
+});
+
+// Collection permission schemas
+export const collectionPermissionLevelSchema = z.enum(['admin', 'member']).or(z.string().min(1));
+
+export const setCollectionPermissionSchema = z.object({
+  adminDid: didSchema,
+  collection: z.string().min(1, 'Collection is required'),
+  canCreate: collectionPermissionLevelSchema.optional(),
+  canRead: collectionPermissionLevelSchema.optional(),
+  canUpdate: collectionPermissionLevelSchema.optional(),
+  canDelete: collectionPermissionLevelSchema.optional(),
+});
+
+export const deleteCollectionPermissionSchema = z.object({
+  adminDid: didSchema,
+  collection: z.string().min(1, 'Collection is required'),
+});
+
+// App default permissions (used during registration)
+export const appDefaultPermissionSchema = z.object({
+  collection: z.string().min(1),
+  defaultCanCreate: collectionPermissionLevelSchema.default('member'),
+  defaultCanRead: collectionPermissionLevelSchema.default('member'),
+  defaultCanUpdate: collectionPermissionLevelSchema.default('member'),
+  defaultCanDelete: collectionPermissionLevelSchema.default('admin'),
+});
+
+export const registerAppWithPermissionsSchema = registerAppSchema.extend({
+  defaultPermissions: z.array(appDefaultPermissionSchema).optional(),
+});
+
+// Role schemas
+export const createRoleSchema = z.object({
+  adminDid: didSchema,
+  name: z.string().min(1).max(100).regex(/^[a-z0-9_-]+$/, 'Role name must be lowercase alphanumeric with hyphens or underscores'),
+  displayName: z.string().min(1).max(255),
+  description: z.string().max(500).optional(),
+  visible: z.boolean().default(false),
+});
+
+export const updateRoleSchema = z.object({
+  adminDid: didSchema,
+  displayName: z.string().min(1).max(255).optional(),
+  description: z.string().max(500).optional(),
+  visible: z.boolean().optional(),
+}).refine(data => data.displayName || data.description !== undefined || data.visible !== undefined, {
+  message: 'At least one field is required',
+});
+
+export const deleteRoleSchema = z.object({
+  adminDid: didSchema,
+});
+
+export const assignRoleSchema = z.object({
+  adminDid: didSchema,
+  memberDid: didSchema,
+  roleName: z.string().min(1),
+});
+
+export const revokeRoleSchema = z.object({
+  adminDid: didSchema,
+  memberDid: didSchema,
+  roleName: z.string().min(1),
+});
