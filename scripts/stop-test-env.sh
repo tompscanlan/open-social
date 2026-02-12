@@ -13,4 +13,7 @@ docker compose \
   -f "$DEVNET_DIR/docker-compose.yml" \
   -f "$PROJECT_DIR/docker-compose.devnet.yml" \
   down -v
+
+# Clean up host-side state so next start seeds fresh accounts
+rm -f "$DEVNET_DIR/data/accounts.json" "$DEVNET_DIR/data/accounts.env"
 echo "==> Done."
