@@ -38,7 +38,7 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
       const pdsHost = config.pdsUrl || 'https://bsky.social';
       try {
         const profileRes = await fetch(
-          `https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=${encodeURIComponent(did)}`
+          `${pdsHost}/xrpc/app.bsky.actor.getProfile?actor=${encodeURIComponent(did)}`
         );
         if (profileRes.ok) {
           const profile = await profileRes.json() as any;
@@ -80,7 +80,7 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
         let avatarBlob;
         try {
           const creatorProfileRes = await fetch(
-            `https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=${encodeURIComponent(creatorDid)}`
+            `${pdsHost}/xrpc/app.bsky.actor.getProfile?actor=${encodeURIComponent(creatorDid)}`
           );
           if (creatorProfileRes.ok) {
             const creatorProfile = await creatorProfileRes.json() as any;
