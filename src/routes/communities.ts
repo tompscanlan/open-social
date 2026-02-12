@@ -315,8 +315,8 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
 
   // Get community details
   router.get('/:did', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const userDid = req.query.userDid as string | undefined;
 
       const community = await db
@@ -418,8 +418,8 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
    *   userDid  — optional. If provided, the user's roles are included.
    */
   router.get('/:did/permissions', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const userDid = req.query.userDid as string | undefined;
       const appId = req.app_data?.app_id;
 
@@ -534,8 +534,8 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
 
   // Delete community
   router.delete('/:did', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = deleteCommunitySchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });

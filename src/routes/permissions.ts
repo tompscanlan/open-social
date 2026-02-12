@@ -53,8 +53,8 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * Retrieve the community's permission settings.
    */
   router.get('/:did/settings', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
     try {
-      const communityDid = decodeURIComponent(req.params.did);
 
       const settings = await db
         .selectFrom('community_settings')
@@ -91,8 +91,8 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * Update community-level permission settings (admin only).
    */
   router.put('/:did/settings', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = updateCommunitySettingsSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
@@ -152,8 +152,8 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * List all app visibility overrides for this community.
    */
   router.get('/:did/apps', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
     try {
-      const communityDid = decodeURIComponent(req.params.did);
 
       const rows = await db
         .selectFrom('community_app_visibility')
@@ -195,9 +195,9 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * When enabling, seeds default collection permissions from the app's defaults.
    */
   router.put('/:did/apps/:appId', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    const appId = req.params.appId;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
-      const appId = req.params.appId;
       const parsed = updateAppVisibilitySchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
@@ -272,9 +272,9 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * List collection-level permissions for an app on this community.
    */
   router.get('/:did/apps/:appId/permissions', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    const appId = req.params.appId;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
-      const appId = req.params.appId;
 
       const rows = await db
         .selectFrom('community_app_collection_permissions')
@@ -304,15 +304,17 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * Set or update a collection permission for an app on this community (admin only).
    */
   router.put('/:did/apps/:appId/permissions', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    const appId = req.params.appId;
+    let collection: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
-      const appId = req.params.appId;
       const parsed = setCollectionPermissionSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
 
-      const { adminDid, collection, canCreate, canRead, canUpdate, canDelete } = parsed.data;
+      const { adminDid, canCreate, canRead, canUpdate, canDelete } = parsed.data;
+      collection = parsed.data.collection;
 
       if (!(await requireAdmin(communityDid, adminDid, res))) return;
 
@@ -369,9 +371,9 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * Remove a collection permission entry (revokes access for that collection via this app).
    */
   router.delete('/:did/apps/:appId/permissions', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    const appId = req.params.appId;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
-      const appId = req.params.appId;
       const parsed = deleteCollectionPermissionSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
@@ -411,8 +413,8 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * List all custom roles for a community.
    */
   router.get('/:did/roles', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
     try {
-      const communityDid = decodeURIComponent(req.params.did);
 
       const roles = await db
         .selectFrom('community_roles')
@@ -442,14 +444,16 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * Create a custom role (admin only).
    */
   router.post('/:did/roles', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    let name: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = createRoleSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
 
-      const { adminDid, name, displayName, description, visible } = parsed.data;
+      const { adminDid, displayName, description, visible } = parsed.data;
+      name = parsed.data.name;
 
       if (!(await requireAdmin(communityDid, adminDid, res))) return;
 
@@ -500,9 +504,9 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * Update a custom role (admin only).
    */
   router.put('/:did/roles/:roleName', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    const roleName = req.params.roleName;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
-      const roleName = req.params.roleName;
       const parsed = updateRoleSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
@@ -555,9 +559,9 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * Also removes all member-role assignments for this role.
    */
   router.delete('/:did/roles/:roleName', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    const roleName = req.params.roleName;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
-      const roleName = req.params.roleName;
       const parsed = deleteRoleSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
@@ -611,9 +615,9 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * If the request includes ?publicOnly=true, only returns visible roles.
    */
   router.get('/:did/members/:memberDid/roles', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    const memberDid = decodeURIComponent(req.params.memberDid);
     try {
-      const communityDid = decodeURIComponent(req.params.did);
-      const memberDid = decodeURIComponent(req.params.memberDid);
       const publicOnly = req.query.publicOnly === 'true';
 
       const assignments = await db
@@ -654,15 +658,17 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * Assign a role to a member (admin only).
    */
   router.post('/:did/members/:memberDid/roles', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    const memberDid = decodeURIComponent(req.params.memberDid);
+    let roleName: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
-      const memberDid = decodeURIComponent(req.params.memberDid);
       const parsed = assignRoleSchema.safeParse({ ...req.body, memberDid });
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
 
-      const { adminDid, roleName } = parsed.data;
+      const { adminDid } = parsed.data;
+      roleName = parsed.data.roleName;
 
       if (!(await requireAdmin(communityDid, adminDid, res))) return;
 
@@ -724,10 +730,10 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
    * Revoke a role from a member (admin only).
    */
   router.delete('/:did/members/:memberDid/roles/:roleName', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    const memberDid = decodeURIComponent(req.params.memberDid);
+    const roleName = req.params.roleName;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
-      const memberDid = decodeURIComponent(req.params.memberDid);
-      const roleName = req.params.roleName;
       const parsed = revokeRoleSchema.safeParse({ ...req.body, memberDid, roleName });
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
