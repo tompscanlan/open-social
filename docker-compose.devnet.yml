@@ -1,0 +1,47 @@
+# Devnet overlay: provides postgres + maildev for atproto-devnet,
+# plus creates the opensocial database for open-social.
+#
+# Usage: ./scripts/start-test-env.sh
+#
+# Requires OPENSOCIAL_DIR env var (set by start-test-env.sh) so the
+# postgres init script volume mount resolves to the correct path.
+
+services:
+  # Shared postgres: PLC uses database "plc", open-social uses "opensocial"
+  postgres:
+    image: postgres:16-alpine
+    container_name: devnet-postgres
+    environment:
+      POSTGRES_USER: ${DEVNET_DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DEVNET_DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DEVNET_DB_NAME:-plc}
+    volumes:
+      - ${OPENSOCIAL_DIR}/scripts/init-opensocial-db.sh:/docker-entrypoint-initdb.d/10-opensocial.sh:ro
+    ports:
+      - "${DEVNET_POSTGRES_PORT:-5433}:5432"
+    networks:
+      - atproto-devnet
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DEVNET_DB_USER:-postgres}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  maildev:
+    image: maildev/maildev:latest
+    container_name: devnet-maildev
+    ports:
+      - "${DEVNET_MAILDEV_WEB_PORT:-1081}:1080"
+      - "${DEVNET_MAILDEV_SMTP_PORT:-1026}:1025"
+    networks:
+      - atproto-devnet
+
+  # Override PLC/PDS to depend on our postgres/maildev
+  plc:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  pds:
+    environment:
+      PDS_EMAIL_SMTP_URL: smtp://maildev:1025
