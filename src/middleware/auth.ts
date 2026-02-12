@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
 import { hashApiKey } from '../lib/crypto';
+import { logger } from '../lib/logger';
 
 export interface AuthenticatedRequest extends Request {
   app_data?: {
@@ -46,7 +47,7 @@ export function createVerifyApiKey(db: Kysely<Database>) {
       req.app_data = app;
       next();
     } catch (error) {
-      console.error('Auth error:', error);
+      logger.error({ error, correlationId: req.correlationId }, 'Auth error');
       res.status(500).json({ error: 'Authentication failed' });
     }
   };

@@ -1,6 +1,7 @@
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
 import { decodeCursor, encodeCursor } from '../lib/pagination';
+import { logger } from '../lib/logger';
 
 export type AuditAction =
   | 'member.approved'
@@ -48,7 +49,11 @@ export function createAuditLogService(db: Kysely<Database>) {
         })
         .execute();
     } catch (err) {
-      console.error('Failed to write audit log:', err);
+      logger.error({ 
+        error: err, 
+        communityDid: params.communityDid, 
+        action: params.action 
+      }, 'Failed to write audit log');
     }
   }
 

@@ -15,6 +15,8 @@ import { createWebhookRouter } from './routes/webhooks';
 import { createPermissionsRouter } from './routes/permissions';
 import { createRateLimiter } from './middleware/rateLimit';
 import { csrfProtection } from './middleware/csrf';
+import { logger } from './lib/logger';
+import { requestLogger } from './middleware/requestLogger';
 
 dotenv.config();
 
@@ -32,18 +34,15 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// Request logging
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
-  next();
-});
+// Request logging with correlation IDs
+app.use(requestLogger);
 
 // Start server
 async function start() {
   try {
     // Initialize database
     const db = createDb(config.databaseUrl);
-    console.log('✅ Database connected');
+    logger.info('Database connected');
 
     // Create OAuth tables if they don't exist
     await db.schema
@@ -80,7 +79,9 @@ async function start() {
     // ─── Search: enable pg_trgm and add trigram indexes ─────────────
     try {
       await sql`CREATE EXTENSION IF NOT EXISTS pg_trgm`.execute(db);
-    } catch (e) { console.warn('Could not create pg_trgm extension:', e); }
+    } catch (e) { 
+      logger.warn({ error: e }, 'Could not create pg_trgm extension');
+    }
 
     // Migrate: add cached metadata columns for community search results
     try {
@@ -95,7 +96,9 @@ async function start() {
     try {
       await sql`CREATE INDEX IF NOT EXISTS idx_communities_handle_trgm ON communities USING gin (handle gin_trgm_ops)`.execute(db);
       await sql`CREATE INDEX IF NOT EXISTS idx_communities_display_name_trgm ON communities USING gin (display_name gin_trgm_ops)`.execute(db);
-    } catch (e) { console.warn('Could not create trigram indexes:', e); }
+    } catch (e) { 
+      logger.warn({ error: e }, 'Could not create trigram indexes');
+    }
 
     // Migrate: drop legacy api_secret_hash column if it still exists
     try {
@@ -117,7 +120,7 @@ async function start() {
       .addColumn('status', 'varchar(50)', (col) => col.notNull().defaultTo('active'))
       .execute();
 
-    console.log('✅ Database tables ready');
+    logger.info('Database tables ready');
 
     // Create new tables for v2 features
     await db.schema
@@ -171,7 +174,7 @@ async function start() {
       .addColumn('updated_at', 'timestamp', (col) => col.notNull().defaultTo(sql`now()`))
       .execute();
 
-    console.log('✅ V2 tables ready');
+    logger.info('V2 tables ready');
 
     // ─── Permissions & moderation tables ─────────────────────────────
 
@@ -282,11 +285,11 @@ async function start() {
       await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_community_app_collection_perms_unique ON community_app_collection_permissions (community_did, app_id, collection)`.execute(db);
     } catch (e) { /* index already exists */ }
 
-    console.log('✅ Permissions tables ready');
+    logger.info('Permissions tables ready');
 
     // Initialize OAuth client
     const oauthClient = await createOAuthClient(db);
-    console.log('✅ OAuth client initialized');
+    logger.info('OAuth client initialized');
 
     // Apply global middleware
     const rateLimiter = createRateLimiter(db);
@@ -314,20 +317,25 @@ async function start() {
 
     // Error handling
     app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-      console.error('Unhandled error:', err);
+      logger.error({ 
+        error: err,
+        correlationId: req.correlationId,
+        path: req.path,
+        method: req.method
+      }, 'Unhandled error');
       res.status(500).json({ error: 'Internal server error' });
     });
     
     app.listen(PORT, () => {
-      console.log(`✅ OpenSocial API running on port ${PORT}`);
-      console.log(`   Health check: http://localhost:${PORT}/health`);
-      console.log(`   Mode: ${config.nodeEnv}`);
-      if (config.nodeEnv === 'development') {
-        console.log(`   OAuth callback: http://127.0.0.1:${PORT}/oauth/callback`);
-      }
+      logger.info({ 
+        port: PORT, 
+        mode: config.nodeEnv,
+        healthCheck: `http://localhost:${PORT}/health`,
+        oauthCallback: config.nodeEnv === 'development' ? `http://127.0.0.1:${PORT}/oauth/callback` : undefined
+      }, 'OpenSocial API server started');
     });
   } catch (error) {
-    console.error('❌ Failed to start server:', error);
+    logger.error({ error }, 'Failed to start server');
     process.exit(1);
   }
 }
