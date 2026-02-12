@@ -128,7 +128,7 @@ async function getSessionAgent(
   const session = await getIronSession<Session>(req, res, sessionOptions);
   
   if (!session.did) {
-    logger.info({}, 'No DID in session');
+    logger.info('No DID in session');
     return null;
   }
 
