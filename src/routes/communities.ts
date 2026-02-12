@@ -16,6 +16,7 @@ import { createWebhookService } from '../services/webhook';
 import { createCommunityAgent } from '../services/atproto';
 import { checkAppVisibility } from '../services/permissions';
 import { config } from '../config';
+import { logger } from '../lib/logger';
 
 export function createCommunityRouter(db: Kysely<Database>): Router {
   const router = Router();
@@ -97,7 +98,7 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
             }
           }
         } catch (e) {
-          console.warn('Could not copy creator avatar:', e);
+          logger.warn({ error: e }, 'Could not copy creator avatar');
         }
 
         // Create profile record
@@ -138,7 +139,7 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
           },
         });
       } catch (e) {
-        console.error('Failed to create community records:', e);
+        logger.error({ error: e, did }, 'Failed to create community records');
       }
 
       await auditLog.log({
@@ -159,7 +160,7 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
         isAdmin: true,
       });
     } catch (error) {
-      console.error('Create community error:', error);
+      logger.error({ error }, 'Create community error');
       res.status(500).json({ error: 'Failed to create community' });
     }
   });
@@ -285,7 +286,7 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
             })
             .where('did', '=', community.did)
             .execute()
-            .catch((err) => console.warn('Failed to update community metadata cache:', err));
+            .catch((err) => logger.warn({ error: err, communityDid: community.did }, 'Failed to update community metadata cache'));
 
           return {
             did: community.did,
@@ -307,7 +308,7 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
         cursor: hasMore ? encodeCursor(offset + limit) : undefined,
       });
     } catch (error) {
-      console.error('List communities error:', error);
+      logger.error({ error }, 'List communities error');
       res.status(500).json({ error: 'Failed to list communities' });
     }
   });
@@ -402,7 +403,7 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
         isAdmin,
       });
     } catch (error) {
-      console.error('Get community error:', error);
+      logger.error({ error, communityDid }, 'Get community error');
       res.status(500).json({ error: 'Failed to get community' });
     }
   });
@@ -507,7 +508,7 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
             }
           } catch {}
         } catch (e) {
-          console.warn('Failed to resolve user roles from PDS:', e);
+          logger.warn({ error: e, communityDid, userDid }, 'Failed to resolve user roles from PDS');
         }
 
         // Custom roles from DB
@@ -526,7 +527,7 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
 
       res.json({ permissions, userRoles });
     } catch (error) {
-      console.error('Get permissions error:', error);
+      logger.error({ error, communityDid }, 'Get permissions error');
       res.status(500).json({ error: 'Failed to get permissions' });
     }
   });
@@ -589,7 +590,7 @@ export function createCommunityRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true });
     } catch (error) {
-      console.error('Delete community error:', error);
+      logger.error({ error, communityDid }, 'Delete community error');
       res.status(500).json({ error: 'Failed to delete community' });
     }
   });

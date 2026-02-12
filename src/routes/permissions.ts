@@ -25,6 +25,7 @@ import { createCommunityAgent } from '../services/atproto';
 import { checkAdmin, seedCollectionPermissions } from '../services/permissions';
 import { createAuditLogService } from '../services/auditLog';
 import { adminCache, memberCache, memberRolesCache } from '../lib/cache';
+import { logger } from '../lib/logger';
 
 export function createPermissionsRouter(db: Kysely<Database>): Router {
   const router = Router();
@@ -80,7 +81,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
         },
       });
     } catch (error) {
-      console.error('Error getting community settings:', error);
+      logger.error({ error, communityDid }, 'Error getting community settings');
       res.status(500).json({ error: 'Failed to get community settings' });
     }
   });
@@ -137,7 +138,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true });
     } catch (error) {
-      console.error('Error updating community settings:', error);
+      logger.error({ error, communityDid }, 'Error updating community settings');
       res.status(500).json({ error: 'Failed to update community settings' });
     }
   });
@@ -183,7 +184,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
 
       res.json({ apps: enriched });
     } catch (error) {
-      console.error('Error listing app visibility:', error);
+      logger.error({ error, communityDid }, 'Error listing app visibility');
       res.status(500).json({ error: 'Failed to list app visibility' });
     }
   });
@@ -257,7 +258,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true });
     } catch (error) {
-      console.error('Error updating app visibility:', error);
+      logger.error({ error, communityDid, appId }, 'Error updating app visibility');
       res.status(500).json({ error: 'Failed to update app visibility' });
     }
   });
@@ -293,7 +294,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
         })),
       });
     } catch (error) {
-      console.error('Error listing collection permissions:', error);
+      logger.error({ error, communityDid, appId }, 'Error listing collection permissions');
       res.status(500).json({ error: 'Failed to list collection permissions' });
     }
   });
@@ -358,7 +359,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true });
     } catch (error) {
-      console.error('Error setting collection permission:', error);
+      logger.error({ error, communityDid, appId, collection }, 'Error setting collection permission');
       res.status(500).json({ error: 'Failed to set collection permission' });
     }
   });
@@ -396,7 +397,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true });
     } catch (error) {
-      console.error('Error deleting collection permission:', error);
+      logger.error({ error, communityDid, appId }, 'Error deleting collection permission');
       res.status(500).json({ error: 'Failed to delete collection permission' });
     }
   });
@@ -431,7 +432,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
         })),
       });
     } catch (error) {
-      console.error('Error listing roles:', error);
+      logger.error({ error, communityDid }, 'Error listing roles');
       res.status(500).json({ error: 'Failed to list roles' });
     }
   });
@@ -489,7 +490,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
 
       res.status(201).json({ success: true, role: { name, displayName, description, visible } });
     } catch (error) {
-      console.error('Error creating role:', error);
+      logger.error({ error, communityDid, name }, 'Error creating role');
       res.status(500).json({ error: 'Failed to create role' });
     }
   });
@@ -543,7 +544,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true });
     } catch (error) {
-      console.error('Error updating role:', error);
+      logger.error({ error, communityDid, roleName }, 'Error updating role');
       res.status(500).json({ error: 'Failed to update role' });
     }
   });
@@ -595,7 +596,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true });
     } catch (error) {
-      console.error('Error deleting role:', error);
+      logger.error({ error, communityDid, roleName }, 'Error deleting role');
       res.status(500).json({ error: 'Failed to delete role' });
     }
   });
@@ -643,7 +644,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
         })),
       });
     } catch (error) {
-      console.error('Error listing member roles:', error);
+      logger.error({ error, communityDid, memberDid }, 'Error listing member roles');
       res.status(500).json({ error: 'Failed to list member roles' });
     }
   });
@@ -713,7 +714,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
 
       res.status(201).json({ success: true });
     } catch (error) {
-      console.error('Error assigning role:', error);
+      logger.error({ error, communityDid, memberDid, roleName }, 'Error assigning role');
       res.status(500).json({ error: 'Failed to assign role' });
     }
   });
@@ -760,7 +761,7 @@ export function createPermissionsRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true });
     } catch (error) {
-      console.error('Error revoking role:', error);
+      logger.error({ error, communityDid, memberDid, roleName }, 'Error revoking role');
       res.status(500).json({ error: 'Failed to revoke role' });
     }
   });

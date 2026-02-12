@@ -20,6 +20,7 @@ import { createCommunityAgent } from '../services/atproto';
 import { createAuditLogService } from '../services/auditLog';
 import { createWebhookService } from '../services/webhook';
 import { config } from '../config';
+import { logger } from '../lib/logger';
 
 /**
  * Resolve a Bluesky profile to get handle, display name, and avatar.
@@ -161,7 +162,7 @@ export function createMemberRouter(db: Kysely<Database>): Router {
         },
       });
     } catch (error) {
-      console.error('Join community error:', error);
+      logger.error({ error, communityDid, userDid }, 'Join community error');
       res.status(500).json({ error: 'Failed to join community' });
     }
   });
@@ -256,7 +257,7 @@ export function createMemberRouter(db: Kysely<Database>): Router {
         message: 'Left the community. Your membership record in your PDS is no longer verified.',
       });
     } catch (error) {
-      console.error('Leave community error:', error);
+      logger.error({ error, communityDid, userDid }, 'Leave community error');
       res.status(500).json({ error: 'Failed to leave community' });
     }
   });
@@ -386,7 +387,7 @@ export function createMemberRouter(db: Kysely<Database>): Router {
         cursor: hasMore ? encodeCursor(offset + limit) : undefined,
       });
     } catch (error) {
-      console.error('List members error:', error);
+      logger.error({ error, communityDid }, 'List members error');
       res.status(500).json({ error: 'Failed to list members' });
     }
   });
@@ -446,7 +447,7 @@ export function createMemberRouter(db: Kysely<Database>): Router {
 
       res.json({ pendingMembers: enriched, total: enriched.length });
     } catch (error) {
-      console.error('List pending members error:', error);
+      logger.error({ error, communityDid }, 'List pending members error');
       res.status(500).json({ error: 'Failed to list pending members' });
     }
   });
@@ -532,7 +533,7 @@ export function createMemberRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true, message: `Member ${memberDid} approved` });
     } catch (error) {
-      console.error('Approve member error:', error);
+      logger.error({ error, communityDid, memberDid }, 'Approve member error');
       res.status(500).json({ error: 'Failed to approve member' });
     }
   });
@@ -606,7 +607,7 @@ export function createMemberRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true, message: `Join request from ${memberDid} rejected` });
     } catch (error) {
-      console.error('Reject member error:', error);
+      logger.error({ error, communityDid, memberDid }, 'Reject member error');
       res.status(500).json({ error: 'Failed to reject member' });
     }
   });
@@ -714,7 +715,7 @@ export function createMemberRouter(db: Kysely<Database>): Router {
         message: `Member ${memberDid} removed from community.`,
       });
     } catch (error) {
-      console.error('Remove member error:', error);
+      logger.error({ error, communityDid, memberDid }, 'Remove member error');
       res.status(500).json({ error: 'Failed to remove member' });
     }
   });
@@ -797,7 +798,7 @@ export function createMemberRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true, admins: updatedAdmins });
     } catch (error) {
-      console.error('Promote admin error:', error);
+      logger.error({ error, communityDid, memberDid }, 'Promote admin error');
       res.status(500).json({ error: 'Failed to promote member to admin' });
     }
   });
@@ -866,7 +867,7 @@ export function createMemberRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true, admins: updatedAdmins });
     } catch (error) {
-      console.error('Demote admin error:', error);
+      logger.error({ error, communityDid, memberDid }, 'Demote admin error');
       res.status(500).json({ error: 'Failed to demote admin' });
     }
   });
@@ -941,7 +942,7 @@ export function createMemberRouter(db: Kysely<Database>): Router {
         admins: updatedAdmins,
       });
     } catch (error) {
-      console.error('Transfer admin error:', error);
+      logger.error({ error, communityDid, newOwnerDid }, 'Transfer admin error');
       res.status(500).json({ error: 'Failed to transfer admin role' });
     }
   });
@@ -1017,7 +1018,7 @@ export function createMemberRouter(db: Kysely<Database>): Router {
         isPending,
       });
     } catch (error) {
-      console.error('Membership check error:', error);
+      logger.error({ error, communityDid, userDid }, 'Membership check error');
       res.status(500).json({ error: 'Failed to check membership' });
     }
   });
@@ -1059,7 +1060,7 @@ export function createMemberRouter(db: Kysely<Database>): Router {
 
       res.json(result);
     } catch (error) {
-      console.error('Audit log error:', error);
+      logger.error({ error, communityDid }, 'Audit log error');
       res.status(500).json({ error: 'Failed to fetch audit log' });
     }
   });

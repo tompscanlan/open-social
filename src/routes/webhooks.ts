@@ -5,6 +5,7 @@ import type { Database } from '../db';
 import { createVerifyApiKey, type AuthenticatedRequest } from '../middleware/auth';
 import { createWebhookSchema, updateWebhookSchema } from '../validation/schemas';
 import { parsePagination, encodeCursor, decodeCursor } from '../lib/pagination';
+import { logger } from '../lib/logger';
 
 export function createWebhookRouter(db: Kysely<Database>): Router {
   const router = Router();
@@ -47,7 +48,7 @@ export function createWebhookRouter(db: Kysely<Database>): Router {
         message: 'Store the secret securely — it is used to verify webhook signatures.',
       });
     } catch (error) {
-      console.error('Create webhook error:', error);
+      logger.error({ error }, 'Create webhook error');
       res.status(500).json({ error: 'Failed to create webhook' });
     }
   });
@@ -82,7 +83,7 @@ export function createWebhookRouter(db: Kysely<Database>): Router {
         cursor: hasMore ? encodeCursor(offset + limit) : undefined,
       });
     } catch (error) {
-      console.error('List webhooks error:', error);
+      logger.error({ error }, 'List webhooks error');
       res.status(500).json({ error: 'Failed to list webhooks' });
     }
   });
@@ -119,7 +120,7 @@ export function createWebhookRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true });
     } catch (error) {
-      console.error('Update webhook error:', error);
+      logger.error({ error, webhookId: req.params.webhookId }, 'Update webhook error');
       res.status(500).json({ error: 'Failed to update webhook' });
     }
   });
@@ -139,7 +140,7 @@ export function createWebhookRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true });
     } catch (error) {
-      console.error('Delete webhook error:', error);
+      logger.error({ error, webhookId: req.params.webhookId }, 'Delete webhook error');
       res.status(500).json({ error: 'Failed to delete webhook' });
     }
   });

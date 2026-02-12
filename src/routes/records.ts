@@ -18,6 +18,7 @@ import {
   satisfiesRole,
   type Operation,
 } from '../services/permissions';
+import { logger } from '../lib/logger';
 
 export function createRecordsRouter(db: Kysely<Database>): Router {
   const router = Router();
@@ -143,7 +144,7 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
         cid: response.data.cid,
       });
     } catch (error: any) {
-      console.error('Error creating community record:', error);
+      logger.error({ error, communityDid, collection, userDid }, 'Error creating community record');
       res.status(500).json({ error: error.message || 'Failed to create record' });
     }
   });
@@ -192,7 +193,7 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
         cid: response.data.cid,
       });
     } catch (error: any) {
-      console.error('Error updating community record:', error);
+      logger.error({ error, communityDid, collection, userDid }, 'Error updating community record');
       res.status(500).json({ error: error.message || 'Failed to update record' });
     }
   });
@@ -234,7 +235,7 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true });
     } catch (error: any) {
-      console.error('Error deleting community record:', error);
+      logger.error({ error, communityDid, collection, userDid }, 'Error deleting community record');
       res.status(500).json({ error: error.message || 'Failed to delete record' });
     }
   });
@@ -301,7 +302,7 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
         cursor: response.data.cursor || undefined,
       });
     } catch (error: any) {
-      console.error('Error listing community records:', error);
+      logger.error({ error, communityDid, collection }, 'Error listing community records');
       res.status(500).json({ error: error.message || 'Failed to list records' });
     }
   });
@@ -360,7 +361,7 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
         value: response.data.value,
       });
     } catch (error: any) {
-      console.error('Error getting community record:', error);
+      logger.error({ error, communityDid, collection, rkey }, 'Error getting community record');
       res.status(500).json({ error: error.message || 'Failed to get record' });
     }
   });
