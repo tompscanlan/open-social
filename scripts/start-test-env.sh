@@ -20,7 +20,8 @@ docker compose \
 echo "==> Waiting for init container to seed accounts..."
 TIMEOUT=60
 ELAPSED=0
-while [ ! -f "$DEVNET_DIR/data/accounts.json" ] || [ "$(cat "$DEVNET_DIR/data/accounts.json" 2>/dev/null)" = "{}" ]; do
+# Wait until accounts.json exists and has at least one account
+while ! jq -e 'length > 0' "$DEVNET_DIR/data/accounts.json" >/dev/null 2>&1; do
   if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
     echo "ERROR: Timed out waiting for devnet init to complete."
     echo "Check: docker logs devnet-init"

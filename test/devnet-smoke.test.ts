@@ -47,6 +47,12 @@ function hashApiKey(key: string): string {
 
 async function loadAccounts(): Promise<Record<string, DevnetAccount>> {
   const fs = await import('fs');
+  if (!fs.existsSync(ACCOUNTS_PATH)) {
+    throw new Error(
+      `Accounts file not found: ${ACCOUNTS_PATH}\n` +
+        'Run "npm run devnet:up" first, or set ACCOUNTS_PATH to the correct location.',
+    );
+  }
   return JSON.parse(fs.readFileSync(ACCOUNTS_PATH, 'utf-8'));
 }
 
@@ -71,7 +77,7 @@ describe('devnet smoke test', () => {
     await pool.query(
       `INSERT INTO apps (app_id, name, domain, creator_did, api_key, status, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, 'active', NOW(), NOW())
-       ON CONFLICT DO NOTHING`,
+       ON CONFLICT (app_id) DO UPDATE SET updated_at = NOW()`,
       [
         TEST_APP_ID,
         'devnet-smoke-test',
