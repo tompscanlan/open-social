@@ -15,6 +15,15 @@ const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 12; // GCM recommended
 const AUTH_TAG_LENGTH = 16;
 
+// Parameters for API key hashing using scrypt.
+// These can be tuned over time if needed.
+const API_KEY_HASH_ALGO = 'scrypt';
+const API_KEY_SALT_LENGTH = 16; // 128-bit salt
+const API_KEY_KEY_LENGTH = 32; // 256-bit derived key
+const API_KEY_SCRYPT_N = 1 << 14; // CPU/memory cost
+const API_KEY_SCRYPT_r = 8;
+const API_KEY_SCRYPT_p = 1;
+
 /**
  * Derive the 32-byte key from the hex config value.
  * Throws at startup if ENCRYPTION_KEY is missing or malformed.
@@ -104,18 +113,74 @@ export function decryptIfNeeded(value: string): string {
 }
 
 /**
- * Hash an API key for storage. Uses SHA-256 — one-way, so the original
- * key cannot be recovered. The key is shown to the user once at creation
- * and then only the hash is stored.
+ * Hash an API key for storage using a computationally expensive KDF.
+ * Uses Node's built-in scrypt with a random salt. The returned string
+ * encodes the algorithm, parameters, salt, and hash in a stable format:
+ *   "scrypt:N:r:p:<saltBase64>:<hashBase64>"
  */
 export function hashApiKey(apiKey: string): string {
-  return crypto.createHash('sha256').update(apiKey).digest('hex');
+  const salt = crypto.randomBytes(API_KEY_SALT_LENGTH);
+  const derivedKey = crypto.scryptSync(apiKey, salt, API_KEY_KEY_LENGTH, {
+    N: API_KEY_SCRYPT_N,
+    r: API_KEY_SCRYPT_r,
+    p: API_KEY_SCRYPT_p,
+  });
+
+  const saltB64 = salt.toString('base64');
+  const hashB64 = derivedKey.toString('base64');
+
+  return [
+    API_KEY_HASH_ALGO,
+    API_KEY_SCRYPT_N,
+    API_KEY_SCRYPT_r,
+    API_KEY_SCRYPT_p,
+    saltB64,
+    hashB64,
+  ].join(':');
 }
 
 /**
  * Compare a raw API key against a stored hash.
+ * Parses the stored representation and re-computes the scrypt hash.
  */
 export function verifyApiKey(rawKey: string, storedHash: string): boolean {
-  const hash = hashApiKey(rawKey);
-  return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(storedHash));
+  try {
+    const parts = storedHash.split(':');
+    if (parts.length !== 6) {
+      return false;
+    }
+
+    const [algo, nStr, rStr, pStr, saltB64, hashB64] = parts;
+    if (algo !== API_KEY_HASH_ALGO) {
+      return false;
+    }
+
+    const N = Number(nStr);
+    const r = Number(rStr);
+    const p = Number(pStr);
+    if (!Number.isFinite(N) || !Number.isFinite(r) || !Number.isFinite(p)) {
+      return false;
+    }
+
+    const salt = Buffer.from(saltB64, 'base64');
+    const storedKey = Buffer.from(hashB64, 'base64');
+    if (salt.length === 0 || storedKey.length === 0) {
+      return false;
+    }
+
+    const derivedKey = crypto.scryptSync(rawKey, salt, storedKey.length, {
+      N,
+      r,
+      p,
+    });
+
+    if (derivedKey.length !== storedKey.length) {
+      return false;
+    }
+
+    return crypto.timingSafeEqual(derivedKey, storedKey);
+  } catch {
+    // Any parse/derivation errors are treated as non-match.
+    return false;
+  }
 }
