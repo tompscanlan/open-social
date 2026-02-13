@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import { config } from '../config';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
-import { hashApiKey } from '../lib/crypto';
+import { hashApiKey, verifyApiKey } from '../lib/crypto';
 import { registerAppWithPermissionsSchema, updateAppSchema, appDefaultPermissionSchema } from '../validation/schemas';
 import { logger } from '../lib/logger';
 
@@ -306,10 +306,11 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
       const app = await db
         .selectFrom('apps')
         .selectAll()
-        .where('api_key', '=', hashApiKey(apiKey))
         .where('status', '=', 'active')
+        .where('api_key', 'is not', null)
         .executeTakeFirst();
-      if (!app) {
+
+      if (!app || !verifyApiKey(apiKey, app.api_key)) {
         return res.status(401).json({ error: 'Invalid API key' });
       }
 

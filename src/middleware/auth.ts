@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
-import { hashApiKey } from '../lib/crypto';
+import { hashApiKey, verifyApiKey } from '../lib/crypto';
 import { logger } from '../lib/logger';
 
 export interface AuthenticatedRequest extends Request {
@@ -30,17 +30,15 @@ export function createVerifyApiKey(db: Kysely<Database>) {
     }
 
     try {
-      // Hash the incoming key and look up the hash in the DB
-      const hashedKey = hashApiKey(apiKey);
-
+      // Look up the app and verify the provided key against the stored hash
       const app = await db
         .selectFrom('apps')
         .selectAll()
-        .where('api_key', '=', hashedKey)
         .where('status', '=', 'active')
+        .where('api_key', 'is not', null)
         .executeTakeFirst();
 
-      if (!app) {
+      if (!app || !verifyApiKey(apiKey, app.api_key)) {
         return res.status(401).json({ error: 'Invalid API key' });
       }
 
