@@ -45,7 +45,7 @@ export function createFakeCommunity(overrides?: Partial<{
 }>) {
   return {
     did: createFakeDid(),
-    handle: faker.internet.userName().toLowerCase(),
+    handle: faker.internet.username().toLowerCase(),
     display_name: faker.company.name(),
     app_password: faker.string.alphanumeric(32),
     creator_did: createFakeDid(),
