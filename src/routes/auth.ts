@@ -15,6 +15,7 @@ import { hasScope, MEMBERSHIP_WRITE_SCOPE, OPENSOCIAL_SCOPES } from '../middlewa
 import { checkAdmin, seedCollectionPermissions } from '../services/permissions';
 import { createAuditLogService } from '../services/auditLog';
 import { memberRolesCache } from '../lib/cache';
+import { logger } from '../lib/logger';
 
 // Configure multer for file uploads
 const upload = multer({
@@ -77,7 +78,7 @@ async function fetchBlueskyAvatar(did: string): Promise<string | undefined> {
     const profile = await publicAgent.getProfile({ actor: did });
     return profile.data.avatar || undefined;
   } catch (err) {
-    console.warn(`Could not fetch Bluesky avatar for ${did}:`, err instanceof Error ? err.message : err);
+    logger.warn({ error: err, did }, 'Could not fetch Bluesky avatar');
     return undefined;
   }
 }
@@ -127,7 +128,7 @@ async function getSessionAgent(
   const session = await getIronSession<Session>(req, res, sessionOptions);
   
   if (!session.did) {
-    console.log('No DID in session');
+    logger.info('No DID in session');
     return null;
   }
 
@@ -149,7 +150,7 @@ async function getSessionAgent(
 
     return agent;
   } catch (err) {
-    console.warn('OAuth restore failed:', err);
+    logger.warn({ error: err }, 'OAuth restore failed');
     await session.destroy();
     return null;
   }
@@ -194,7 +195,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
           const oauthSession = await oauthClient.restore(session.did);
           if (oauthSession) oauthSession.signOut();
         } catch (err) {
-          console.warn('OAuth restore failed:', err);
+          logger.warn({ error: err }, 'OAuth restore failed');
         }
       }
 
@@ -206,7 +207,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       await session.save();
     } catch (err) {
-      console.error('OAuth callback failed:', err);
+      logger.error({ error: err }, 'OAuth callback failed');
     }
 
     // Redirect back to the frontend
@@ -234,7 +235,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       res.redirect(url.toString());
     } catch (err) {
-      console.error('OAuth authorize failed:', err);
+      logger.error({ error: err }, 'OAuth authorize failed');
       const error = err instanceof Error ? err.message : 'unexpected error';
       return res.type('json').send({ error });
     }
@@ -252,7 +253,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         const oauthSession = await oauthClient.restore(session.did);
         if (oauthSession) await oauthSession.signOut();
       } catch (err) {
-        console.warn('Failed to revoke credentials:', err);
+        logger.warn({ error: err }, 'Failed to revoke credentials');
       }
     }
 
@@ -280,7 +281,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         description: profile.data.description,
       });
     } catch (err) {
-      console.error('Failed to get user:', err);
+      logger.error({ error: err }, 'Failed to get user');
       return res.status(500).json({ error: 'Failed to get user' });
     }
   });
@@ -316,7 +317,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
               .executeTakeFirst();
 
             if (!community) {
-              console.warn(`Community ${communityDid} not found in database`);
+              logger.warn({ communityDid }, 'Community not found in database');
               return null;
             }
 
@@ -376,11 +377,11 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
                 },
               };
             } catch (profileErr) {
-              console.warn(`Failed to fetch profile for community ${communityDid}:`, profileErr instanceof Error ? profileErr.message : profileErr);
+              logger.warn({ error: profileErr, communityDid }, 'Failed to fetch profile for community');
               return null;
             }
           } catch (err) {
-            console.error(`Failed to process membership record:`, err);
+            logger.error({ error: err }, 'Failed to process membership record');
             return null;
           }
         })
@@ -391,7 +392,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       return res.json({ memberships: validMemberships });
     } catch (err) {
-      console.error('Failed to get memberships:', err);
+      logger.error({ error: err }, 'Failed to get memberships');
       return res.status(500).json({ error: 'Failed to get memberships' });
     }
   });
@@ -424,7 +425,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         const profile = await agent.getProfile({ actor: existingDid });
         communityHandle = profile.data.handle || existingDid;
       } catch (e) {
-        console.warn('Could not resolve handle, using DID as fallback');
+        logger.warn({ error: e, did: existingDid }, 'Could not resolve handle, using DID as fallback');
         communityHandle = existingDid;
       }
 
@@ -464,7 +465,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
           },
         });
       } catch (err) {
-        console.error('Failed to create profile record:', err);
+        logger.error({ error: err, did: existingDid }, 'Failed to create profile record');
         return res.status(500).json({ 
           error: 'Failed to create community profile',
           details: err instanceof Error ? err.message : 'Unknown error'
@@ -484,7 +485,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
           },
         });
       } catch (err) {
-        console.error('Failed to create admins list:', err);
+        logger.error({ error: err, did: existingDid }, 'Failed to create admins list');
         return res.status(500).json({ 
           error: 'Failed to create admins list',
           details: err instanceof Error ? err.message : 'Unknown error'
@@ -532,7 +533,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         },
       });
     } catch (err) {
-      console.error('Failed to create community:', err);
+      logger.error({ error: err }, 'Failed to create community');
       return res.status(500).json({ 
         error: 'Failed to create community',
         details: err instanceof Error ? err.message : 'Unknown error'
@@ -661,7 +662,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
               })
               .where('did', '=', c.did)
               .execute()
-              .catch((err) => console.warn('Failed to update community metadata cache:', err));
+              .catch((err) => logger.warn({ error: err, communityDid: c.did }, 'Failed to update community metadata cache'));
 
             return {
               did: c.did,
@@ -689,7 +690,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       return res.json({ communities: results });
     } catch (err) {
-      console.error('Community search error:', err);
+      logger.error({ error: err }, 'Community search error');
       return res.status(500).json({ error: 'Search failed' });
     }
   });
@@ -808,7 +809,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         userRole,
       });
     } catch (err) {
-      console.error('Failed to get community details:', err);
+      logger.error({ error: err, communityDid: req.params.did }, 'Failed to get community details');
       return res.status(500).json({ 
         error: 'Failed to get community details',
         details: err instanceof Error ? err.message : 'Unknown error'
@@ -940,7 +941,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         message: 'Successfully joined the community',
       });
     } catch (err) {
-      console.error('Failed to join community:', err);
+      logger.error({ error: err, communityDid: req.params.did }, 'Failed to join community');
       return res.status(500).json({
         error: 'Failed to join community',
         details: err instanceof Error ? err.message : 'Unknown error',
@@ -1022,7 +1023,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       return res.json({ success: true, avatar: blobRef });
     } catch (err) {
-      console.error('Failed to upload avatar:', err);
+      logger.error({ error: err, communityDid: req.params.did }, 'Failed to upload avatar');
       return res.status(500).json({ 
         error: 'Failed to upload avatar',
         details: err instanceof Error ? err.message : 'Unknown error'
@@ -1091,7 +1092,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
           });
           blobRef = uploadResponse.data.blob;
         } catch (e) {
-          console.error('Failed to reuse Bluesky banner:', e);
+          logger.error({ error: e, communityDid: req.params.did }, 'Failed to reuse Bluesky banner');
           return res.status(500).json({ error: 'Failed to reuse Bluesky banner' });
         }
       } else {
@@ -1129,7 +1130,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       return res.json({ success: true, banner: blobRef });
     } catch (err) {
-      console.error('Failed to upload banner:', err);
+      logger.error({ error: err, communityDid: req.params.did }, 'Failed to upload banner');
       return res.status(500).json({ 
         error: 'Failed to upload banner',
         details: err instanceof Error ? err.message : 'Unknown error'
@@ -1213,7 +1214,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       return res.json({ success: true });
     } catch (err) {
-      console.error('Failed to update community profile:', err);
+      logger.error({ error: err, communityDid: req.params.did }, 'Failed to update community profile');
       return res.status(500).json({ 
         error: 'Failed to update community profile',
         details: err instanceof Error ? err.message : 'Unknown error'
@@ -1286,7 +1287,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         message: 'Community deleted successfully',
       });
     } catch (err) {
-      console.error('Failed to delete community:', err);
+      logger.error({ error: err, communityDid: req.params.did }, 'Failed to delete community');
       return res.status(500).json({ 
         error: 'Failed to delete community',
         details: err instanceof Error ? err.message : 'Unknown error'
@@ -1430,7 +1431,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       return res.json({ members: resultsWithRoles, total: resultsWithRoles.length, primaryAdminDid });
     } catch (err) {
-      console.error('Failed to list members:', err);
+      logger.error({ error: err, communityDid: req.params.did }, 'Failed to list members');
       return res.status(500).json({
         error: 'Failed to list members',
         details: err instanceof Error ? err.message : 'Unknown error',
@@ -1516,7 +1517,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       return res.json({ success: true, admins: updatedAdmins });
     } catch (err) {
-      console.error('Failed to promote member to admin:', err);
+      logger.error({ error: err, communityDid: req.params.did, memberDid: req.params.memberDid }, 'Failed to promote member to admin');
       return res.status(500).json({
         error: 'Failed to promote member to admin',
         details: err instanceof Error ? err.message : 'Unknown error',
@@ -1591,7 +1592,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       return res.json({ success: true, admins: updatedAdmins });
     } catch (err) {
-      console.error('Failed to demote admin:', err);
+      logger.error({ error: err, communityDid: req.params.did, memberDid: req.params.memberDid }, 'Failed to demote admin');
       return res.status(500).json({
         error: 'Failed to demote admin',
         details: err instanceof Error ? err.message : 'Unknown error',
@@ -1693,7 +1694,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         message: `Member ${memberDid} removed from community. Their membership record remains in their PDS but is no longer verified.`,
       });
     } catch (err) {
-      console.error('Failed to remove member:', err);
+      logger.error({ error: err, communityDid: req.params.did, memberDid: req.params.memberDid }, 'Failed to remove member');
       return res.status(500).json({
         error: 'Failed to remove member',
         details: err instanceof Error ? err.message : 'Unknown error',
@@ -1751,7 +1752,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       return res.json({ success: true, message: `Primary admin transferred to ${newOwnerDid}`, admins: updatedAdmins });
     } catch (err) {
-      console.error('Failed to transfer admin:', err);
+      logger.error({ error: err, communityDid: req.params.did, newOwnerDid: req.body.newOwnerDid }, 'Failed to transfer admin');
       return res.status(500).json({ error: 'Failed to transfer admin role' });
     }
   });
@@ -1826,7 +1827,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         },
       });
     } catch (error) {
-      console.error('Error getting community settings:', error);
+      logger.error({ error, communityDid: req.params.did }, 'Error getting community settings');
       res.status(500).json({ error: 'Failed to get community settings' });
     }
   });
@@ -1879,14 +1880,14 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
             record: { ...currentProfile, $type: 'community.opensocial.profile', type: communityType },
           });
         } catch (err) {
-          console.error('Failed to update community type in profile:', err);
+          logger.error({ error: err, communityDid }, 'Failed to update community type in profile');
         }
       }
 
       await auditLog.log({ communityDid, adminDid, action: 'settings.updated', metadata: { appVisibilityDefault, blockedAppIds, communityType } });
       res.json({ success: true });
     } catch (error) {
-      console.error('Error updating community settings:', error);
+      logger.error({ error, communityDid: req.params.did }, 'Error updating community settings');
       res.status(500).json({ error: 'Failed to update community settings' });
     }
   });
@@ -1919,7 +1920,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
 
       res.json({ apps: enriched, allApps });
     } catch (error) {
-      console.error('Error listing app visibility:', error);
+      logger.error({ error, communityDid: req.params.did }, 'Error listing app visibility');
       res.status(500).json({ error: 'Failed to list app visibility' });
     }
   });
@@ -1955,7 +1956,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       await auditLog.log({ communityDid, adminDid, action: actionMap[status as keyof typeof actionMap], metadata: { appId } });
       res.json({ success: true });
     } catch (error) {
-      console.error('Error updating app visibility:', error);
+      logger.error({ error, communityDid: req.params.did, appId: req.params.appId }, 'Error updating app visibility');
       res.status(500).json({ error: 'Failed to update app visibility' });
     }
   });
@@ -1988,7 +1989,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         })),
       });
     } catch (error) {
-      console.error('Error listing collection permissions:', error);
+      logger.error({ error, communityDid: req.params.did, appId: req.params.appId }, 'Error listing collection permissions');
       res.status(500).json({ error: 'Failed to list collection permissions' });
     }
   });
@@ -2033,7 +2034,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       await auditLog.log({ communityDid, adminDid, action: 'collection.permission.updated', metadata: { appId, collection } });
       res.json({ success: true });
     } catch (error) {
-      console.error('Error setting collection permission:', error);
+      logger.error({ error, communityDid: req.params.did, appId: req.params.appId }, 'Error setting collection permission');
       res.status(500).json({ error: 'Failed to set collection permission' });
     }
   });
@@ -2058,7 +2059,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       await auditLog.log({ communityDid, adminDid, action: 'collection.permission.deleted', metadata: { appId, collection } });
       res.json({ success: true });
     } catch (error) {
-      console.error('Error deleting collection permission:', error);
+      logger.error({ error, communityDid: req.params.did, appId: req.params.appId }, 'Error deleting collection permission');
       res.status(500).json({ error: 'Failed to delete collection permission' });
     }
   });
@@ -2089,7 +2090,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         })),
       });
     } catch (error) {
-      console.error('Error listing roles:', error);
+      logger.error({ error, communityDid: req.params.did }, 'Error listing roles');
       res.status(500).json({ error: 'Failed to list roles' });
     }
   });
@@ -2119,7 +2120,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       await auditLog.log({ communityDid, adminDid, action: 'role.created', metadata: { name, displayName, visible, canViewAuditLog } });
       res.status(201).json({ success: true, role: { name, displayName, description, visible, canViewAuditLog } });
     } catch (error) {
-      console.error('Error creating role:', error);
+      logger.error({ error, communityDid: req.params.did }, 'Error creating role');
       res.status(500).json({ error: 'Failed to create role' });
     }
   });
@@ -2144,7 +2145,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       await auditLog.log({ communityDid, adminDid, action: 'role.updated', metadata: { roleName, displayName, description, visible } });
       res.json({ success: true });
     } catch (error) {
-      console.error('Error updating role:', error);
+      logger.error({ error, communityDid: req.params.did, roleName: req.params.roleName }, 'Error updating role');
       res.status(500).json({ error: 'Failed to update role' });
     }
   });
@@ -2164,7 +2165,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       await auditLog.log({ communityDid, adminDid, action: 'role.deleted', metadata: { roleName } });
       res.json({ success: true });
     } catch (error) {
-      console.error('Error deleting role:', error);
+      logger.error({ error, communityDid: req.params.did, roleName: req.params.roleName }, 'Error deleting role');
       res.status(500).json({ error: 'Failed to delete role' });
     }
   });
@@ -2194,7 +2195,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
         })),
       });
     } catch (error) {
-      console.error('Error listing member roles:', error);
+      logger.error({ error, communityDid: req.params.did, memberDid: req.params.memberDid }, 'Error listing member roles');
       res.status(500).json({ error: 'Failed to list member roles' });
     }
   });
@@ -2223,7 +2224,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       await auditLog.log({ communityDid, adminDid, action: 'role.assigned', targetDid: memberDid, metadata: { roleName } });
       res.status(201).json({ success: true });
     } catch (error) {
-      console.error('Error assigning role:', error);
+      logger.error({ error, communityDid: req.params.did, memberDid: req.params.memberDid }, 'Error assigning role');
       res.status(500).json({ error: 'Failed to assign role' });
     }
   });
@@ -2243,7 +2244,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       await auditLog.log({ communityDid, adminDid, action: 'role.revoked', targetDid: memberDid, metadata: { roleName } });
       res.json({ success: true });
     } catch (error) {
-      console.error('Error revoking role:', error);
+      logger.error({ error, communityDid: req.params.did, memberDid: req.params.memberDid, roleName: req.params.roleName }, 'Error revoking role');
       res.status(500).json({ error: 'Failed to revoke role' });
     }
   });
@@ -2304,7 +2305,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       const result = await auditLog.query({ communityDid, cursor, limit });
       res.json(result);
     } catch (error) {
-      console.error('Error fetching audit log:', error);
+      logger.error({ error, communityDid: req.params.did }, 'Error fetching audit log');
       res.status(500).json({ error: 'Failed to fetch audit log' });
     }
   });
@@ -2319,7 +2320,7 @@ export function createAuthRouter(oauthClient: NodeOAuthClient, db: Kysely<Databa
       const hasAccess = await canViewAuditLog(communityDid, agent.assertDid);
       res.json({ canViewAuditLog: hasAccess });
     } catch (error) {
-      console.error('Error checking audit log access:', error);
+      logger.error({ error, communityDid: req.params.did }, 'Error checking audit log access');
       res.status(500).json({ error: 'Failed to check audit log access' });
     }
   });

@@ -20,6 +20,7 @@ import { createCommunityAgent } from '../services/atproto';
 import { createAuditLogService } from '../services/auditLog';
 import { createWebhookService } from '../services/webhook';
 import { config } from '../config';
+import { logger } from '../lib/logger';
 
 /**
  * Resolve a Bluesky profile to get handle, display name, and avatar.
@@ -62,14 +63,16 @@ export function createMemberRouter(db: Kysely<Database>): Router {
   // For open communities: creates membershipProof immediately
   // For admin-approved communities: adds to pending_members table
   router.post('/:did/members/join', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    let userDid: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = joinCommunitySchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
 
-      const { userDid, membershipCid } = parsed.data;
+      userDid = parsed.data.userDid;
+      const { membershipCid } = parsed.data;
 
       const community = await db
         .selectFrom('communities')
@@ -161,21 +164,22 @@ export function createMemberRouter(db: Kysely<Database>): Router {
         },
       });
     } catch (error) {
-      console.error('Join community error:', error);
+      logger.error({ error, communityDid, userDid }, 'Join community error');
       res.status(500).json({ error: 'Failed to join community' });
     }
   });
 
   // ─── LEAVE COMMUNITY ──────────────────────────────────────────────
   router.post('/:did/members/leave', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    let userDid: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = leaveCommunitySchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
 
-      const { userDid } = parsed.data;
+      userDid = parsed.data.userDid;
 
       const community = await db
         .selectFrom('communities')
@@ -256,15 +260,15 @@ export function createMemberRouter(db: Kysely<Database>): Router {
         message: 'Left the community. Your membership record in your PDS is no longer verified.',
       });
     } catch (error) {
-      console.error('Leave community error:', error);
+      logger.error({ error, communityDid, userDid }, 'Leave community error');
       res.status(500).json({ error: 'Failed to leave community' });
     }
   });
 
   // ─── LIST MEMBERS (paginated, with profiles) ──────────────────────
   router.get('/:did/members', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = listMembersSchema.safeParse(req.query);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid query', details: parsed.error.flatten() });
@@ -386,15 +390,15 @@ export function createMemberRouter(db: Kysely<Database>): Router {
         cursor: hasMore ? encodeCursor(offset + limit) : undefined,
       });
     } catch (error) {
-      console.error('List members error:', error);
+      logger.error({ error, communityDid }, 'List members error');
       res.status(500).json({ error: 'Failed to list members' });
     }
   });
 
   // ─── LIST PENDING MEMBERS (admin only) ─────────────────────────────
   router.get('/:did/members/pending', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const adminDid = req.query.adminDid as string;
 
       if (!adminDid) {
@@ -446,21 +450,23 @@ export function createMemberRouter(db: Kysely<Database>): Router {
 
       res.json({ pendingMembers: enriched, total: enriched.length });
     } catch (error) {
-      console.error('List pending members error:', error);
+      logger.error({ error, communityDid }, 'List pending members error');
       res.status(500).json({ error: 'Failed to list pending members' });
     }
   });
 
   // ─── APPROVE PENDING MEMBER ────────────────────────────────────────
   router.post('/:did/members/approve', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    let memberDid: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = approveMemberSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
 
-      const { adminDid, memberDid, reason } = parsed.data;
+      const { adminDid, reason } = parsed.data;
+      memberDid = parsed.data.memberDid;
 
       const community = await db
         .selectFrom('communities')
@@ -532,21 +538,23 @@ export function createMemberRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true, message: `Member ${memberDid} approved` });
     } catch (error) {
-      console.error('Approve member error:', error);
+      logger.error({ error, communityDid, memberDid }, 'Approve member error');
       res.status(500).json({ error: 'Failed to approve member' });
     }
   });
 
   // ─── REJECT PENDING MEMBER ────────────────────────────────────────
   router.post('/:did/members/reject', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    let memberDid: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = rejectMemberSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
 
-      const { adminDid, memberDid, reason } = parsed.data;
+      const { adminDid, reason } = parsed.data;
+      memberDid = parsed.data.memberDid;
 
       const community = await db
         .selectFrom('communities')
@@ -606,16 +614,16 @@ export function createMemberRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true, message: `Join request from ${memberDid} rejected` });
     } catch (error) {
-      console.error('Reject member error:', error);
+      logger.error({ error, communityDid, memberDid }, 'Reject member error');
       res.status(500).json({ error: 'Failed to reject member' });
     }
   });
 
   // ─── REMOVE MEMBER (admin only) ───────────────────────────────────
   router.delete('/:did/members/:memberDid', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    const memberDid = decodeURIComponent(req.params.memberDid);
     try {
-      const communityDid = decodeURIComponent(req.params.did);
-      const memberDid = decodeURIComponent(req.params.memberDid);
       const parsed = removeMemberSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
@@ -714,21 +722,23 @@ export function createMemberRouter(db: Kysely<Database>): Router {
         message: `Member ${memberDid} removed from community.`,
       });
     } catch (error) {
-      console.error('Remove member error:', error);
+      logger.error({ error, communityDid, memberDid }, 'Remove member error');
       res.status(500).json({ error: 'Failed to remove member' });
     }
   });
 
   // ─── PROMOTE TO ADMIN ─────────────────────────────────────────────
   router.post('/:did/admins/promote', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    let memberDid: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = promoteMemberSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
 
-      const { adminDid, memberDid } = parsed.data;
+      const { adminDid } = parsed.data;
+      memberDid = parsed.data.memberDid;
 
       const community = await db
         .selectFrom('communities')
@@ -797,21 +807,23 @@ export function createMemberRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true, admins: updatedAdmins });
     } catch (error) {
-      console.error('Promote admin error:', error);
+      logger.error({ error, communityDid, memberDid }, 'Promote admin error');
       res.status(500).json({ error: 'Failed to promote member to admin' });
     }
   });
 
   // ─── DEMOTE ADMIN ─────────────────────────────────────────────────
   router.post('/:did/admins/demote', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    let memberDid: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = demoteMemberSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
 
-      const { adminDid, memberDid } = parsed.data;
+      const { adminDid } = parsed.data;
+      memberDid = parsed.data.memberDid;
 
       const community = await db
         .selectFrom('communities')
@@ -866,21 +878,23 @@ export function createMemberRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true, admins: updatedAdmins });
     } catch (error) {
-      console.error('Demote admin error:', error);
+      logger.error({ error, communityDid, memberDid }, 'Demote admin error');
       res.status(500).json({ error: 'Failed to demote admin' });
     }
   });
 
   // ─── TRANSFER PRIMARY ADMIN ────────────────────────────────────────
   router.post('/:did/admins/transfer', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    let newOwnerDid: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = transferAdminSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
 
-      const { currentOwnerDid, newOwnerDid } = parsed.data;
+      newOwnerDid = parsed.data.newOwnerDid;
+      const { currentOwnerDid } = parsed.data;
 
       const community = await db
         .selectFrom('communities')
@@ -941,26 +955,26 @@ export function createMemberRouter(db: Kysely<Database>): Router {
         admins: updatedAdmins,
       });
     } catch (error) {
-      console.error('Transfer admin error:', error);
+      logger.error({ error, communityDid, newOwnerDid }, 'Transfer admin error');
       res.status(500).json({ error: 'Failed to transfer admin role' });
     }
   });
 
   // ─── MEMBERSHIP CHECK ─────────────────────────────────────────────
   router.post('/:did/membership/check', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    let userDid: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = joinCommunitySchema.safeParse(req.body);
       if (!parsed.success) {
         // Fallback: accept { userDid } directly
-        const { userDid } = req.body;
+        userDid = req.body.userDid;
         if (!userDid) {
           return res.status(400).json({ error: 'userDid is required' });
         }
-        req.body.userDid = userDid;
+      } else {
+        userDid = parsed.data.userDid;
       }
-
-      const userDid = parsed.success ? parsed.data.userDid : req.body.userDid;
 
       const community = await db
         .selectFrom('communities')
@@ -1017,15 +1031,15 @@ export function createMemberRouter(db: Kysely<Database>): Router {
         isPending,
       });
     } catch (error) {
-      console.error('Membership check error:', error);
+      logger.error({ error, communityDid, userDid }, 'Membership check error');
       res.status(500).json({ error: 'Failed to check membership' });
     }
   });
 
   // ─── AUDIT LOG ─────────────────────────────────────────────────────
   router.get('/:did/audit-log', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = auditLogQuerySchema.safeParse(req.query);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid query', details: parsed.error.flatten() });
@@ -1059,7 +1073,7 @@ export function createMemberRouter(db: Kysely<Database>): Router {
 
       res.json(result);
     } catch (error) {
-      console.error('Audit log error:', error);
+      logger.error({ error, communityDid }, 'Audit log error');
       res.status(500).json({ error: 'Failed to fetch audit log' });
     }
   });
