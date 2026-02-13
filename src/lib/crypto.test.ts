@@ -120,20 +120,26 @@ describe('crypto.ts', () => {
   });
 
   describe('hashApiKey', () => {
-    it('should hash an API key to a 64-char hex string', () => {
+    it('should hash an API key using scrypt format', () => {
       const apiKey = 'my-api-key-12345';
       const hash = hashApiKey(apiKey);
 
-      expect(hash).toHaveLength(64);
-      expect(hash).toMatch(/^[a-f0-9]{64}$/);
+      // Should be in format: scrypt:N:r:p:saltBase64:hashBase64
+      expect(hash).toMatch(/^scrypt:\d+:\d+:\d+:[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$/);
+      expect(hash.startsWith('scrypt:')).toBe(true);
     });
 
-    it('should produce consistent hashes for the same key', () => {
+    it('should produce different hashes for the same key (random salt)', () => {
       const apiKey = 'my-api-key-12345';
       const hash1 = hashApiKey(apiKey);
       const hash2 = hashApiKey(apiKey);
 
-      expect(hash1).toBe(hash2);
+      // Due to random salt, hashes should be different
+      expect(hash1).not.toBe(hash2);
+
+      // But both should verify correctly
+      expect(verifyApiKey(apiKey, hash1)).toBe(true);
+      expect(verifyApiKey(apiKey, hash2)).toBe(true);
     });
 
     it('should produce different hashes for different keys', () => {
@@ -145,8 +151,24 @@ describe('crypto.ts', () => {
 
     it('should handle empty strings', () => {
       const hash = hashApiKey('');
-      expect(hash).toHaveLength(64);
-      expect(hash).toMatch(/^[a-f0-9]{64}$/);
+
+      // Should still be in scrypt format
+      expect(hash).toMatch(/^scrypt:\d+:\d+:\d+:[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$/);
+
+      // Should be verifiable
+      expect(verifyApiKey('', hash)).toBe(true);
+    });
+
+    it('should include scrypt parameters in hash', () => {
+      const hash = hashApiKey('test');
+      const parts = hash.split(':');
+
+      expect(parts[0]).toBe('scrypt');
+      expect(parts[1]).toBe('16384'); // N
+      expect(parts[2]).toBe('8'); // r
+      expect(parts[3]).toBe('1'); // p
+      expect(parts[4]).toBeTruthy(); // salt
+      expect(parts[5]).toBeTruthy(); // hash
     });
   });
 
@@ -180,6 +202,32 @@ describe('crypto.ts', () => {
       // Should not throw even with wrong key (same hash length)
       expect(() => verifyApiKey('wrong-key', hash)).not.toThrow();
       expect(verifyApiKey('wrong-key', hash)).toBe(false);
+    });
+
+    it('should return false for malformed hash strings', () => {
+      const apiKey = 'test-key';
+
+      // Invalid formats should return false
+      expect(verifyApiKey(apiKey, 'invalid')).toBe(false);
+      expect(verifyApiKey(apiKey, 'sha256:abcdef')).toBe(false);
+      expect(verifyApiKey(apiKey, 'scrypt:1:2')).toBe(false); // too few parts
+      expect(verifyApiKey(apiKey, 'scrypt:abc:8:1:salt:hash')).toBe(false); // invalid N
+    });
+
+    it('should return false for invalid base64 in hash', () => {
+      const apiKey = 'test-key';
+
+      // Invalid base64 should be handled gracefully
+      expect(verifyApiKey(apiKey, 'scrypt:16384:8:1:!!!invalid!!!:hash')).toBe(false);
+      expect(verifyApiKey(apiKey, 'scrypt:16384:8:1:salt:!!!invalid!!!')).toBe(false);
+    });
+
+    it('should handle long API keys', () => {
+      const longKey = 'a'.repeat(1000);
+      const hash = hashApiKey(longKey);
+
+      expect(verifyApiKey(longKey, hash)).toBe(true);
+      expect(verifyApiKey('wrong' + longKey, hash)).toBe(false);
     });
   });
 });
