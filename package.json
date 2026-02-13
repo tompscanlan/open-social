@@ -13,7 +13,14 @@
     "db:setup": "psql $DATABASE_URL -f scripts/schema.sql",
     "db:reset": "./scripts/reset-db.sh",
     "clear-data": "tsx scripts/clearData.ts",
-    "migrate:admins": "tsx scripts/migrateAdmins.ts"
+    "migrate:admins": "tsx scripts/migrateAdmins.ts",
+    "devnet:up": "./scripts/start-test-env.sh",
+    "devnet:down": "./scripts/stop-test-env.sh",
+    "dev:devnet": "bash -c 'set -a && source .env.devnet && exec tsx watch src/index.ts'",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:devnet": "bash -c 'set -a && source .env.devnet && exec vitest run test/devnet-smoke.test.ts'",
+    "test:integration": "vitest run test/integration/"
   },
   "author": "",
   "license": "MIT",

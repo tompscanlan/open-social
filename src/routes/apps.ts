@@ -9,6 +9,7 @@ import type { Kysely } from 'kysely';
 import type { Database } from '../db';
 import { hashApiKey } from '../lib/crypto';
 import { registerAppWithPermissionsSchema, updateAppSchema, appDefaultPermissionSchema } from '../validation/schemas';
+import { logger } from '../lib/logger';
 
 type Session = { did?: string };
 
@@ -38,7 +39,7 @@ async function getSessionAgent(
     const oauthSession = await oauthClient.restore(session.did);
     return oauthSession ? new Agent(oauthSession) : null;
   } catch (err) {
-    console.warn('OAuth restore failed:', err);
+    logger.warn({ error: err, did: session.did }, 'OAuth restore failed');
     await session.destroy();
     return null;
   }
@@ -118,7 +119,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
         message: 'Store the api_key securely — treat it like a password.',
       });
     } catch (err) {
-      console.error('Error registering app:', err);
+      logger.error({ error: err }, 'Error registering app');
       return res.status(500).json({ error: 'Failed to register app' });
     }
   });
@@ -140,7 +141,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
 
       return res.json({ apps });
     } catch (err) {
-      console.error('Error listing apps:', err);
+      logger.error({ error: err }, 'Error listing apps');
       return res.status(500).json({ error: 'Failed to list apps' });
     }
   });
@@ -166,7 +167,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
 
       return res.json({ app });
     } catch (err) {
-      console.error('Error getting app:', err);
+      logger.error({ error: err, appId: req.params.appId }, 'Error getting app');
       return res.status(500).json({ error: 'Failed to get app' });
     }
   });
@@ -221,7 +222,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
 
       return res.json({ success: true });
     } catch (err) {
-      console.error('Error updating app:', err);
+      logger.error({ error: err, appId: req.params.appId }, 'Error updating app');
       return res.status(500).json({ error: 'Failed to update app' });
     }
   });
@@ -248,7 +249,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
 
       return res.json({ success: true, message: 'App deactivated' });
     } catch (err) {
-      console.error('Error deleting app:', err);
+      logger.error({ error: err, appId: req.params.appId }, 'Error deleting app');
       return res.status(500).json({ error: 'Failed to delete app' });
     }
   });
@@ -288,7 +289,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
         message: 'Store the new api_key securely. The old key is now invalid.',
       });
     } catch (err) {
-      console.error('Error rotating key:', err);
+      logger.error({ error: err, appId: req.params.appId }, 'Error rotating key');
       return res.status(500).json({ error: 'Failed to rotate API key' });
     }
   });
@@ -321,7 +322,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
         },
       });
     } catch (err) {
-      console.error('Error verifying credentials:', err);
+      logger.error({ error: err }, 'Error verifying credentials');
       return res.status(500).json({ error: 'Failed to verify credentials' });
     }
   });
@@ -366,7 +367,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
         })),
       });
     } catch (err) {
-      console.error('Error listing default permissions:', err);
+      logger.error({ error: err, appId: req.params.appId }, 'Error listing default permissions');
       return res.status(500).json({ error: 'Failed to list default permissions' });
     }
   });
@@ -439,7 +440,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
 
       return res.json({ success: true });
     } catch (err) {
-      console.error('Error creating/updating default permission:', err);
+      logger.error({ error: err, appId: req.params.appId }, 'Error creating/updating default permission');
       return res.status(500).json({ error: 'Failed to save default permission' });
     }
   });
@@ -491,7 +492,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
 
       return res.json({ success: true });
     } catch (err) {
-      console.error('Error updating default permission:', err);
+      logger.error({ error: err, appId: req.params.appId }, 'Error updating default permission');
       return res.status(500).json({ error: 'Failed to update default permission' });
     }
   });
@@ -527,7 +528,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
 
       return res.json({ success: true });
     } catch (err) {
-      console.error('Error deleting default permission:', err);
+      logger.error({ error: err, appId: req.params.appId }, 'Error deleting default permission');
       return res.status(500).json({ error: 'Failed to delete default permission' });
     }
   });
@@ -567,7 +568,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
         isCustom: !!rateLimit,
       });
     } catch (err) {
-      console.error('Error getting rate limit:', err);
+      logger.error({ error: err, appId: req.params.appId }, 'Error getting rate limit');
       return res.status(500).json({ error: 'Failed to get rate limit' });
     }
   });
@@ -625,7 +626,7 @@ export function createAppRouter(oauthClient: NodeOAuthClient, db: Kysely<Databas
         windowMs: effectiveWindowMs,
       });
     } catch (err) {
-      console.error('Error setting rate limit:', err);
+      logger.error({ error: err, appId: req.params.appId }, 'Error setting rate limit');
       return res.status(500).json({ error: 'Failed to set rate limit' });
     }
   });

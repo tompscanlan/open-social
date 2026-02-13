@@ -1,5 +1,6 @@
 import type { Kysely } from 'kysely';
 import type { Database } from '../db';
+import { logger } from '../lib/logger';
 
 export type WebhookEvent =
   | 'member.joined'
@@ -48,11 +49,15 @@ export function createWebhookService(db: Kysely<Database>) {
       // Fire and forget \u2014 don't block the response
       for (const webhook of matchingWebhooks) {
         fireWebhook(webhook.url, payload, webhook.secret).catch((err) => {
-          console.error(`Webhook delivery failed for ${webhook.url}:`, err.message);
+          logger.error({ 
+            webhookUrl: webhook.url, 
+            event, 
+            error: err.message 
+          }, 'Webhook delivery failed');
         });
       }
     } catch (err) {
-      console.error('Webhook dispatch error:', err);
+      logger.error({ error: err, event, communityDid }, 'Webhook dispatch error');
     }
   }
 

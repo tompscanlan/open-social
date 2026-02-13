@@ -18,6 +18,7 @@ import {
   satisfiesRole,
   type Operation,
 } from '../services/permissions';
+import { logger } from '../lib/logger';
 
 export function createRecordsRouter(db: Kysely<Database>): Router {
   const router = Router();
@@ -107,14 +108,18 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
    * Body: { userDid, collection, record, rkey? }
    */
   router.post('/:did/records', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    let userDid: string | undefined;
+    let collection: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = createRecordSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
 
-      const { userDid, collection, record, rkey } = parsed.data;
+      userDid = parsed.data.userDid;
+      collection = parsed.data.collection;
+      const { record, rkey } = parsed.data;
 
       const result = await enforcePermission(req, res, communityDid, userDid, collection, 'create');
       if (!result) return;
@@ -143,7 +148,7 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
         cid: response.data.cid,
       });
     } catch (error: any) {
-      console.error('Error creating community record:', error);
+      logger.error({ error, communityDid, collection, userDid }, 'Error creating community record');
       res.status(500).json({ error: error.message || 'Failed to create record' });
     }
   });
@@ -155,14 +160,18 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
    * Body: { userDid, collection, rkey, record }
    */
   router.put('/:did/records', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    let userDid: string | undefined;
+    let collection: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
       const parsed = updateRecordSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid input', details: parsed.error.flatten() });
       }
 
-      const { userDid, collection, rkey, record } = parsed.data;
+      userDid = parsed.data.userDid;
+      collection = parsed.data.collection;
+      const { rkey, record } = parsed.data;
 
       const result = await enforcePermission(req, res, communityDid, userDid, collection, 'update');
       if (!result) return;
@@ -192,7 +201,7 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
         cid: response.data.cid,
       });
     } catch (error: any) {
-      console.error('Error updating community record:', error);
+      logger.error({ error, communityDid, collection, userDid }, 'Error updating community record');
       res.status(500).json({ error: error.message || 'Failed to update record' });
     }
   });
@@ -204,15 +213,16 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
    * Query: ?userDid=...
    */
   router.delete('/:did/records/:collection/:rkey', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    const { collection, rkey } = req.params;
+    let userDid: string | undefined;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
-      const { collection, rkey } = req.params;
       const parsed = deleteRecordSchema.safeParse(req.query);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid query', details: parsed.error.flatten() });
       }
 
-      const { userDid } = parsed.data;
+      userDid = parsed.data.userDid;
 
       const result = await enforcePermission(req, res, communityDid, userDid, collection, 'delete');
       if (!result) return;
@@ -234,7 +244,7 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
 
       res.json({ success: true });
     } catch (error: any) {
-      console.error('Error deleting community record:', error);
+      logger.error({ error, communityDid, collection, userDid }, 'Error deleting community record');
       res.status(500).json({ error: error.message || 'Failed to delete record' });
     }
   });
@@ -246,9 +256,9 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
    * Now subject to app visibility and read permission checks.
    */
   router.get('/:did/records/:collection', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    const collection = req.params.collection;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
-      const { collection } = req.params;
       const parsed = listRecordsSchema.safeParse(req.query);
       if (!parsed.success) {
         return res.status(400).json({ error: 'Invalid query', details: parsed.error.flatten() });
@@ -301,7 +311,7 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
         cursor: response.data.cursor || undefined,
       });
     } catch (error: any) {
-      console.error('Error listing community records:', error);
+      logger.error({ error, communityDid, collection }, 'Error listing community records');
       res.status(500).json({ error: error.message || 'Failed to list records' });
     }
   });
@@ -311,9 +321,9 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
    * Get a specific record.
    */
   router.get('/:did/records/:collection/:rkey', verifyApiKey, async (req: AuthenticatedRequest, res) => {
+    const communityDid = decodeURIComponent(req.params.did);
+    const { collection, rkey } = req.params;
     try {
-      const communityDid = decodeURIComponent(req.params.did);
-      const { collection, rkey } = req.params;
       const userDid = req.query.userDid as string | undefined;
       const appId = req.app_data?.app_id;
 
@@ -360,7 +370,7 @@ export function createRecordsRouter(db: Kysely<Database>): Router {
         value: response.data.value,
       });
     } catch (error: any) {
-      console.error('Error getting community record:', error);
+      logger.error({ error, communityDid, collection, rkey }, 'Error getting community record');
       res.status(500).json({ error: error.message || 'Failed to get record' });
     }
   });
